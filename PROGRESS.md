@@ -38,6 +38,8 @@
 
 **V2 核心决策**（grilling 逐决策产出）：显式指派 · 每 Agent 一进程（`cmd/agent -name`）· agents 表 · 记忆分层（team 共享 + 个人私有）· 自动重试 · blocked 上报 · 团队看板 · 2 秒轮询。
 
+> 方向演进（2026-08-15）：最终愿景定为**飞书式**（消息驱动协作）——发消息 @ 下属 → 干活 → 回消息。原"团队看板"前端改为"飞书式会话界面"；知识库定稿为**双层**（team 共享 + 成员私有，只装文档+代码，交流不沉淀，靠会话历史临时查）。见 docs/v2-design.md 第 12 节。
+
 > 完整蓝图 + 参考映射（Multica / TencentDB-Agent-Memory / LoopX）见 `docs/v2-design.md`
 
 ## V2 课程计划（未排期）
@@ -51,8 +53,10 @@
 | M4.5-4 | **单聊闭环** | @解析→issues + agent 完成→回消息 | ✅ 已达成 |
 | 第 10 课 | **M5 可靠性** | `attempts` 自动重试（failed→queued）+ blocked 上报（重试耗尽 / claude"我无法完成"）+ 终端告警 | ⬜ 计划中 |
 | 第 11 课 | **M6 飞书式前端** | 会话列表 + 消息流 + 输入框 + 2 秒轮询（原"团队看板"改造） | ⬜ 计划中 |
-| 第 12 课 | **M7 记忆 + 上下文** | `memory` 表 scope（team/agent_id）+ 会话历史注入（"改蓝色"不丢上下文） | ⬜ 计划中 |
+| 第 12 课 | **M7 双层知识库** | `memory` 表 scope（team/agent_id）+ 文档上传 + 代码归档 + 注入；**交流不沉淀**（会话历史临时查） | ⬜ 计划中 |
 | 后 | **群聊 + 多 agent @** | 群成员各自领活（@提及 + 成员校验） | ⬜ 计划中 |
+
+> 建议推进顺序（未确认）：M5 可靠性 → M6 飞书式前端 → M7 双层知识库
 
 ## 关键教学点（边学边记）
 
@@ -83,6 +87,9 @@
 - **组合主键**（V2 M4.5-3）：`PRIMARY KEY (conversation_id, agent_id)`——PRIMARY KEY 可以是多列，天然保证"一个会话一个 agent 最多一行"
 - **事务原子性**（V2 M4.5-3）：`BeginTx/Commit/Rollback` + `defer tx.Rollback()` 惯用法——会话+成员两个写操作要么都成要么都回滚，防脏状态
 - **消息驱动协作**（V2 M4.5-4）：发消息时 `strings.Contains(content, "@"+名字)` 解析 @（中文名不用正则）→ 创建 issues（assignee=被 @ 者）→ 消息带 task_id；agent 完成是主流程，回消息是**副作用**（`GetMessageByTask` 反查来源会话 → 输出写回），不改任务状态
+- **交流 = 过程，知识库 = 沉淀**（V2 M7 定稿）：消息（交流）不沉淀进知识库，靠会话历史临时查；知识库只装**文档 + 代码**，不装闲聊——两者分工，避免冗余和上下文爆炸
+- **双层知识库**（V2 M7 定稿）：`scope=team` 老板写、所有 agent 读（项目介绍/注意事项/规范）；`scope=agent_<id>` 该 agent + 老板写、只有本人读（文档/代码）。现仓库 CLAUDE.md 就是"team 知识库"的文件原型
+- **目录隔离 vs scope**（V2 M7 讨论结论）：claude 按目录隔离记忆 = **物理隔绝**（解决"私有不串味"）；数据库 scope = **选择性共享**（解决"B review A / team 知识"）——团队场景两半都需要，claude auto-memory 在多 agent 共享仓库时是泄漏源，禁用/绕过
 
 ## 文件清单（当前）
 
@@ -100,6 +107,6 @@ mini-agents/
   internal/agent/deepseek.go  ✅ DeepSeekEngine 预留 stub（dsh 待接入）
   internal/agent/fake.go      ✅ FakeEngine（干跑用，不调 LLM 省 token）
   internal/agent/engine.go    ✅ NewEngine 工厂（按名字选实现，多态入口）
-  web/index.html              ⬜ M6 团队看板（V2 计划）
-  internal/memory/            ⬜ M7 记忆层 Capture/Recall（V2 计划）
+  web/index.html              ⬜ M6 飞书式前端（会话列表 + 消息流 + 输入框 + 2 秒轮询）
+  internal/memory/            ⬜ M7 双层知识库（memory 表 + 文档/代码归档 + 注入）
 ```
