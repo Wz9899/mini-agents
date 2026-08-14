@@ -19,15 +19,21 @@ type Result struct {
 	DurationMs int64  // 执行耗时（毫秒）
 }
 
-// Runner 负责执行 claude -p，是 worker 的"双手"。
-// Command 字段可替换成假程序路径，方便以后测试（不用真调 claude）。
-type Runner struct {
+// Engine 是所有"引擎"的统一约定：给一句 prompt，还你一次执行结果。
+// 谁实现 Execute 谁就是引擎——claude、pi、deepseek 都行，调用方不关心。
+type Engine interface {
+	Execute(ctx context.Context, prompt string) (Result, error)
+}
+
+// ClaudeEngine 用 Claude Code 执行：spawn `claude -p <prompt>` 拿文本。
+// 这是第一种引擎。Command 字段可替换成假程序路径，方便以后测试（不用真调 claude）。
+type ClaudeEngine struct {
 	Command string
 }
 
-// NewRunner 创建一个默认的 runner。
+// NewClaudeEngine 创建 claude 引擎。
 // Windows 上直接指向 npm 装的 claude.exe——绕开 cmd shim 的 GBK 编码坑。
-func NewRunner() *Runner {
+func NewClaudeEngine() *ClaudeEngine {
 	cmd := "claude" // 非 Windows 直接用 PATH 里的 claude
 	if runtime.GOOS == "windows" {
 		// npm 全局安装的原生可执行文件（真正的 .exe，不是 shim 脚本）
@@ -40,16 +46,16 @@ func NewRunner() *Runner {
 			}
 		}
 	}
-	return &Runner{Command: cmd}
+	return &ClaudeEngine{Command: cmd}
 }
 
-// Execute 跑一次 `claude -p <prompt>`，返回结果。
+// Execute 实现 Engine 接口：跑一次 `claude -p <prompt>`，返回结果。
 // 直接 exec 原生可执行文件：Go 用 UTF-16 把参数传给 Windows 的 CreateProcess，
 // 中文 prompt 不会被 cmd 的 GBK 代码页破坏（这是之前乱码 bug 的根因）。
-func (r *Runner) Execute(ctx context.Context, prompt string) (Result, error) {
+func (e *ClaudeEngine) Execute(ctx context.Context, prompt string) (Result, error) {
 	start := time.Now() // 计时开始
 
-	cmd := exec.CommandContext(ctx, r.Command, "-p", prompt)
+	cmd := exec.CommandContext(ctx, e.Command, "-p", prompt)
 
 	// CombinedOutput 同时拿到标准输出和错误输出（合并成一份）
 	out, err := cmd.CombinedOutput()
