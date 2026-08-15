@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mini-agents 团队台</title>
+  <style>
+    /* ═══ 1. 设计令牌（token）：整个界面的"调色板" ───
+       把颜色/字体集中定义成变量，全界面引用——改一处全变。
+       灵感来自"夜间调度台"：深蓝黑工作台 + 设备红绿灯。 */
+    :root {
+      --bg: #0D1117;      /* 工作台底色：深蓝黑 */
+      --panel: #151B23;   /* 侧栏 / 面板 */
+      --panel2: #1B2430;  /* 输入条 / 悬停 */
+      --line: #232B37;    /* 分隔线 */
+      --text: #EAE6DF;    /* 主文字：暖白 */
+      --muted: #87919F;   /* 次要文字 */
+      --amber: #E8A13C;   /* 老板身份：琥珀（你的消息） */
+      --blue: #4FB3FF;    /* 交互 / 选中：亮蓝 */
+      --green: #4FD1A5;   /* 运行中：绿灯 */
+      --red: #FF5D5D;     /* blocked：红灯（呼应 M5 终端红告警） */
+      --mono: "Cascadia Mono", Consolas, monospace; /* 等宽：时间戳/状态/agent 消息 */
+    }
+
+    /* ═══ 2. 全局重置 + 骨架布局 ─── */
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* box-sizing: border-box：宽高已含内边距/边框，设了 260px 就真的是 260px */
+
+    html, body { height: 100%; }
+    body {
+      display: flex;            /* 横排：侧栏 + 主区 */
+      height: 100vh;            /* 撑满一屏高度 */
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+      font-size: 14px;
+    }
+
+    /* ═══ 3. 左侧会话列表 ═══ */
+    #sidebar {
+      width: 260px;
+      flex-shrink: 0;           /* 固定宽，主区挤不进来 */
+      display: flex;
+      flex-direction: column;   /* 上下排：头 + 列表 */
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+    }
+    .sidebar-head {
+      display: flex;
+      justify-content: space-between; /* 标题靠左、按钮靠右 */
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .sidebar-head h1 {
+      font-size: 15px;
+      letter-spacing: 0.12em;   /* 字距拉开一点：工整的"控制台"感 */
+      color: var(--text);
+    }
+    #btn-new {
+      width: 26px; height: 26px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+    #btn-new:hover { color: var(--blue); border-color: var(--blue); }
+
+    #conv-list {
+      flex: 1;                  /* 占满剩余高度 */
+      overflow-y: auto;         /* 会话多了就滚动 */
+      list-style: none;
+    }
+    .conv-item {
+      padding: 10px 16px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(35, 43, 55, .6);
+    }
+    .conv-item:hover { background: var(--panel2); }
+    .conv-item.active {
+      background: var(--panel2);
+      border-left: 2px solid var(--blue); /* 当前会话：左缘亮蓝竖条 */
+    }
+    .conv-item .conv-name { font-size: 13px; font-weight: 600; }
+    .conv-item .conv-meta {
+      display: flex; align-items: center; gap: 6px;
+      font-family: var(--mono);
+      font-size: 11px; color: var(--muted);
+      margin-top: 3px;
+    }
+
+    /* ═══ 4. 状态灯（签名元素）═══
+       每个 agent 条目一颗灯：灰=闲置、绿呼吸=正在干、红=blocked。
+       设备红绿灯语义——"这个团队有没有在干活"扫一眼就知道。 */
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+    }
+    .dot.running { background: var(--green); animation: pulse 1.6s infinite; }
+    .dot.blocked { background: var(--red); }
+    @keyframes pulse { 50% { opacity: .35; } } /* 绿点忽明忽暗 = 正在干活 */
+
+    /* ═══ 5. 右侧主区 ═══ */
+    #main {
+      flex: 1;                  /* 占满剩余宽度 */
+      display: flex;
+      flex-direction: column;   /* 上下排：标题栏 + 消息流 + 输入条 */
+      min-width: 0;             /* 允许内部滚动，防内容把布局撑爆 */
+    }
+    #conv-head {
+      display: flex; align-items: center; gap: 8px;
+      padding: 12px 20px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+    #conv-head h2 { font-size: 14px; font-weight: 600; }
+    .conv-type {
+      font-family: var(--mono);
+      font-size: 11px; color: var(--muted);
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;     /* 胶囊标签：direct / group */
+    }
+    .member-chips { display: flex; gap: 6px; margin-left: auto; }
+    /* margin-left: auto：把 chip 组推到标题栏最右端 */
+    .chip {
+      padding: 4px 10px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--green);
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .chip:hover { border-color: var(--green); }
+    /* 点击 chip = 把 @名字 插进输入框，触发 agent 干活 */
+
+    /* 空会话提示：引导用户先 @ 一位成员 */
+    .empty {
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 20px;
+    }
+
+    /* ═══ 6. 消息流（工作记录流，不是聊天气泡）═══ */
+    #msg-flow {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .msg { max-width: 640px; }  /* 消息不超宽，长行保留呼吸感 */
+    .msg .msg-meta {
+      display: flex; align-items: center; gap: 8px;
+      font-family: var(--mono);
+      font-size: 11px; color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .msg .msg-meta .who { font-weight: 600; }
+    .msg.user .who { color: var(--amber); } /* 老板：琥珀色名字 */
+    .msg.agent .who { color: var(--green); } /* agent：绿灯名字 */
+    .msg .msg-body {
+      padding: 10px 12px;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-left: 2px solid var(--line);
+      border-radius: 0 8px 8px 0; /* 左边直角右圆角：像"贴上去的工作记录" */
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;    /* 保留换行：agent 回答里的代码/列表原样显示 */
+      word-break: break-word;
+    }
+    .msg.user .msg-body { border-left-color: var(--amber); }
+    .msg.agent .msg-body { border-left-color: var(--green); }
+    .msg.blocked .msg-body {   /* 关联任务 blocked 的消息：红灯警告 */
+      border-left-color: var(--red);
+      background: rgba(255, 93, 93, .08);
+    }
+
+    /* ═══ 7. 底部输入条 ═══ */
+    #composer {
+      display: flex; align-items: flex-end; gap: 10px;
+      padding: 12px 20px;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+    #input {
+      flex: 1;
+      resize: none;             /* 禁止手动拖拽（自动增高由 JS 管） */
+      background: var(--panel2);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: inherit;
+      font-size: 13px; line-height: 1.5;
+    }
+    #input:focus { outline: none; border-color: var(--blue); }
+    /* :focus 亮蓝描边：纯键盘用户也知道自己在输入 */
+    #btn-send {
+      padding: 10px 18px;
+      background: var(--blue);
+      color: #0D1117;
+      border: none; border-radius: 8px;
+      font-size: 13px; font-weight: 600;
+      cursor: pointer;
+    }
+    #btn-send:hover { filter: brightness(1.1); }
+
+    /* ═══ 8. 收尾：滚动条 + 窄屏 ═══ */
+    ::-webkit-scrollbar { width: 8px; }
+    ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+    @media (max-width: 720px) { #sidebar { width: 200px; } } /* 窄屏侧栏收窄 */
+
+    /* ═══ 9. 入职 / 新建会话 对话框 ═══
+       dialog 是浏览器原生弹窗：showModal() 打开时自带遮罩、自带 Esc 关闭。
+       样式全部复用上面的设计令牌，跟整个界面同一种皮肤。 */
+    .head-actions { display: flex; gap: 6px; } /* 侧栏两个按钮并排 */
+    dialog {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 20px 24px;
+      min-width: 340px;
+    }
+    dialog::backdrop { background: rgba(0, 0, 0, .55); } /* 遮罩：压暗背景，焦点聚在弹窗 */
+    dialog h3 { font-size: 14px; margin-bottom: 14px; }
+    dialog form { display: flex; flex-direction: column; gap: 10px; }
+    dialog label {
+      display: flex; flex-direction: column; gap: 4px;
+      font-size: 12px; color: var(--muted);
+    }
+    dialog input, dialog select {
+      background: var(--panel2); color: var(--text);
+      border: 1px solid var(--line); border-radius: 6px;
+      padding: 8px 10px; font-size: 13px;
+    }
+    dialog input:focus, dialog select:focus { outline: none; border-color: var(--blue); }
+    .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
+    .dlg-actions button {
+      padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 13px;
+      border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+    }
+    .dlg-actions button[type="submit"] { background: var(--blue); color: #0D1117; border: none; font-weight: 600; }
+    #new-members {   /* 成员多选区：一行一员工，勾选入群 */
+      border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+      display: flex; flex-wrap: wrap; gap: 8px;
+      max-height: 160px; overflow-y: auto;
+    }
+    #new-members legend { padding: 0 6px; font-size: 12px; color: var(--muted); }
+    #new-members label { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--text); }
+  </style>
+</head>
+<body>
+
+  <!-- ═══ 左侧：会话列表 ═══ -->
+  <aside id="sidebar">
+    <header class="sidebar-head">
+      <h1>团队台</h1>
+      <div class="head-actions">
+        <button id="btn-hire" title="入职新员工">＋人</button>
+        <button id="btn-new" title="新建会话">＋</button>
+      </div>
+    </header>
+    <!-- 会话列表：JS 每 2 秒刷新填充 -->
+    <ul id="conv-list"></ul>
+  </aside>
+
+  <!-- ═══ 右侧：消息主区 ═══ -->
+  <main id="main">
+    <!-- 当前会话的标题栏：名字 + 类型 + 状态灯 -->
+    <header id="conv-head"></header>
+
+    <!-- 消息流：滚动的对话记录，JS 填充 -->
+    <section id="msg-flow"></section>
+
+    <!-- 底部：输入条（@员工 触发干活） -->
+    <footer id="composer">
+      <textarea id="input" rows="1" placeholder="消息里 @员工 触发干活 · Enter 发送"></textarea>
+      <button id="btn-send">发送</button>
+    </footer>
+  </main>
+
+  <!-- ═══ 入职新员工 对话框 ═══ -->
+  <dialog id="dlg-hire">
+    <form id="hire-form">
+      <h3>入职新员工</h3>
+      <label>名字
+        <input id="hire-name" required placeholder="如：小周">
+      </label>
+      <label>引擎
+        <select id="hire-engine">
+          <option value="claude">claude</option>
+          <option value="pi" selected>pi</option>
+          <option value="deepseek">deepseek</option>
+          <option value="fake">fake</option>
+        </select>
+      </label>
+      <label>职责（可选，不填 = 无固定职责）
+        <input id="hire-role" placeholder="如：前端工程师">
+      </label>
+      <label>人设（可选）
+        <input id="hire-desc" placeholder="一句话介绍自己">
+      </label>
+      <div class="dlg-actions">
+        <button type="button" id="hire-cancel">取消</button>
+        <button type="submit">入职</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- ═══ 新建会话 对话框 ═══ -->
+  <dialog id="dlg-new">
+    <form id="new-form">
+      <h3>新建会话</h3>
+      <label>会话名
+        <input id="new-name" required placeholder="如：和小周的私聊 / 项目组">
+      </label>
+      <label>类型
+        <select id="new-type">
+          <option value="direct">direct 单聊</option>
+          <option value="group">group 群聊</option>
+        </select>
+      </label>
+      <fieldset id="new-members">
+        <legend>成员（勾选入群）</legend>
+        <!-- JS 填充：每个员工一个勾选框 -->
+      </fieldset>
+      <div class="dlg-actions">
+        <button type="button" id="new-cancel">取消</button>
+        <button type="submit">创建</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script>
+    /* ═══ 1. 全局状态 ═══
+       页面记三个东西，轮询每 2 秒刷新它们，再重画界面。 */
+    let currentConv = null; // 当前打开的会话 id（null = 还没选）
+    let convs = [];         // 会话列表（带成员）
+    let team = [];          // 团队状态 [{ID,Name,Role,Status}]
+    let agents = [];        // 全部员工档案（新建会话的成员多选用）
+
+    /* ═══ 2. 拉数据的两个小工具 ═══ */
+    // getJSON：抓一个接口并解析成对象数组。!res.ok = HTTP 非 2xx → 抛错
+    async function getJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(url + ' → ' + res.status);
+      return res.json();
+    }
+    // esc：HTML 转义——把 <、>、& 等变成安全写法，防止内容里的特殊字符
+    // 被当成"代码"执行（XSS）。消息内容来自用户/agent，必须当纯文本处理。
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[c]));
+    }
+
+    /* ═══ 3. 拉三个接口 ═══ */
+    async function loadConvs() {
+      convs = await getJSON('/api/conversations');
+      renderConvs();
+    }
+    async function loadTeam() {
+      team = await getJSON('/api/team');
+      renderConvs(); // 状态灯变了 → 列表重画（顺带刷新头部）
+    }
+    async function loadMessages() {
+      if (!currentConv) { renderMessages([]); return; } // 没选会话就显示空
+      const msgs = await getJSON('/api/conversations/' + currentConv + '/messages');
+      renderMessages(msgs);
+    }
+    async function loadAgents() {
+      agents = await getJSON('/api/agents');
+      renderMemberList(); // 员工列表变了 → 重画"新建会话"的成员勾选
+    }
+    // renderMemberList：把每个员工画成一个勾选框。role 空 = 无预设职责，显示"通用"
+    function renderMemberList() {
+      const box = document.getElementById('new-members');
+      box.innerHTML = '';
+      for (const a of agents) {
+        const role = a.Role === '' ? '通用' : a.Role;
+        const lab = document.createElement('label');
+        lab.innerHTML = '<input type="checkbox" value="' + esc(a.Name) + '"> ' +
+          esc(a.Name) + '（' + esc(role) + '）';
+        box.appendChild(lab);
+      }
+    }
+
+    /* ═══ 4. 渲染：会话列表 ═══ */
+    function renderConvs() {
+      const ul = document.getElementById('conv-list');
+      ul.innerHTML = ''; // 清空重画（最简单可靠的刷新方式）
+      for (const c of convs) {
+        const li = document.createElement('li');
+        li.className = 'conv-item' + (c.ID === currentConv ? ' active' : '');
+        li.onclick = () => { // 点会话 = 切换当前会话并拉消息
+          currentConv = c.ID;
+          renderConvs(); // 立刻重画（高亮跟着变）
+          loadMessages();
+        };
+        li.innerHTML =
+          '<div class="conv-name">' + esc(c.Name) + '</div>' +
+          '<div class="conv-meta">' + convLights(c) + '<span>' + esc(c.Type) + '</span></div>';
+        ul.appendChild(li);
+      }
+      renderConvHead();
+    }
+
+    // convLights：会话条目里一串状态灯，每个成员一颗（绿=干、红=卡、灰=闲）
+    function convLights(c) {
+      if (!c.Members) return '';
+      return c.Members.map(name => {
+        const st = team.find(t => t.Name === name); // 在团队状态里找这位
+        const cls = st && st.Status === 'running' ? 'running'
+                 : st && st.Status === 'blocked' ? 'blocked' : '';
+        return '<span class="dot ' + cls + '" title="' + esc(name) + '"></span>';
+      }).join('');
+    }
+
+    /* ═══ 5. 渲染：会话头部（名字 + 类型 + 成员快捷 @ chip）═══ */
+    function renderConvHead() {
+      const head = document.getElementById('conv-head');
+      if (!currentConv) { head.innerHTML = '<h2>选择一个会话</h2>'; return; }
+      const c = convs.find(x => x.ID === currentConv);
+      if (!c) return;
+      head.innerHTML =
+        '<h2>' + esc(c.Name) + '</h2>' +
+        '<span class="conv-type">' + esc(c.Type) + '</span>' +
+        '<div class="member-chips">' + (c.Members || []).map(name =>
+          '<button class="chip" data-name="' + esc(name) + '">@' + esc(name) + '</button>'
+        ).join('') + '</div>';
+      // 点 chip = 把 @名字 追加到输入框（触发 agent 干活的第一步）
+      head.querySelectorAll('.chip').forEach(b => {
+        b.onclick = () => {
+          const inp = document.getElementById('input');
+          const sep = (inp.value === '' || inp.value.endsWith(' ')) ? '' : ' ';
+          inp.value += sep + '@' + b.dataset.name + ' ';
+          inp.focus();
+        };
+      });
+    }
+
+    /* ═══ 6. 渲染：消息流（工作记录流）═══ */
+    function renderMessages(msgs) {
+      const flow = document.getElementById('msg-flow');
+      const nearBottom = flow.scrollHeight - flow.scrollTop - flow.clientHeight < 80;
+      // 记录"是不是在底部"：在底部就自动贴底，正在往上翻历史就别打扰
+      flow.innerHTML = '';
+      if (msgs.length === 0) {
+        flow.innerHTML = '<p class="empty">还没有消息。点击右上 @ 成员开始安排工作。</p>';
+      } else {
+        for (const m of msgs) {
+          const div = document.createElement('div');
+          // 发送者显示：user=你；agent=用 id 到 team 里反查名字（找不到先叫 agent，下轮刷新补上）
+          const sender = m.SenderType === 'user' ? '你'
+            : (team.find(t => t.ID === m.SenderID)?.Name || 'agent');
+          div.className = 'msg ' + (m.SenderType === 'user' ? 'user' : 'agent');
+          div.innerHTML =
+            '<div class="msg-meta"><span class="who">' + esc(sender) + '</span>' +
+            '<span>' + fmtTime(m.CreatedAt) + '</span></div>' +
+            '<div class="msg-body">' + esc(m.Content) + '</div>';
+          flow.appendChild(div);
+        }
+      }
+      if (nearBottom) flow.scrollTop = flow.scrollHeight; // 贴底
+    }
+
+    // fmtTime：ISO 时间 → 时分秒（如 22:51:54）
+    function fmtTime(iso) {
+      const d = new Date(iso);
+      const p = n => String(n).padStart(2, '0'); // 1 → "01"
+      return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    }
+
+    /* ═══ 7. 发消息 ═══ */
+    async function sendMessage() {
+      const inp = document.getElementById('input');
+      const content = inp.value.trim();
+      if (!content || !currentConv) return; // 空消息 / 没选会话 → 不发
+      await fetch('/api/conversations/' + currentConv + '/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content }) // 原样发送：@成员 由 server 解析触发干活
+      });
+      inp.value = '';      // 清空输入框
+      loadMessages();      // 立刻刷新（不用等 2 秒轮询）
+      loadConvs();         // 可能新任务入队，会话/状态刷新
+    }
+
+    /* ═══ 8. 事件绑定 + 轮询启动 ═══ */
+    document.getElementById('btn-send').onclick = sendMessage;
+    document.getElementById('input').addEventListener('keydown', e => {
+      // Enter 发送；Shift+Enter 换行（textarea 原生行为保留）
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+
+    /* ═══ 8.5 入职 / 新建会话 ═══ */
+    document.getElementById('btn-hire').onclick = () => document.getElementById('dlg-hire').showModal();
+    document.getElementById('btn-new').onclick = () => {
+      renderMemberList(); // 打开前重画成员勾选，确保是最新
+      document.getElementById('dlg-new').showModal();
+    };
+    document.getElementById('hire-cancel').onclick = () => document.getElementById('dlg-hire').close();
+    document.getElementById('new-cancel').onclick = () => document.getElementById('dlg-new').close();
+
+    // 入职提交：名字必填；职责/人设留空 = 无预设职责（role 存空串）
+    document.getElementById('hire-form').onsubmit = async e => {
+      e.preventDefault(); // 拦掉表单默认的"整页提交刷新"
+      const body = {
+        name: document.getElementById('hire-name').value.trim(),
+        engine: document.getElementById('hire-engine').value,
+        role: document.getElementById('hire-role').value.trim(),
+        description: document.getElementById('hire-desc').value.trim(),
+      };
+      if (!body.name) return;
+      try {
+        const res = await fetch('/api/agents', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) { alert(await res.text()); return; } // 后端报错（如重名）原样弹给用户
+        document.getElementById('dlg-hire').close();
+        loadTeam();
+        loadAgents();
+      } catch (err) { alert('入职失败: ' + err); }
+    };
+
+    // 新建会话提交：勾选的成员转成 [{name}] 发给后端
+    document.getElementById('new-form').onsubmit = async e => {
+      e.preventDefault();
+      const body = {
+        name: document.getElementById('new-name').value.trim(),
+        type: document.getElementById('new-type').value,
+        members: [...document.querySelectorAll('#new-members input:checked')].map(i => ({ name: i.value })),
+      };
+      if (!body.name || body.members.length === 0) { alert('会话名和成员都要填'); return; }
+      try {
+        const res = await fetch('/api/conversations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!res.ok) { alert(await res.text()); return; }
+        document.getElementById('dlg-new').close();
+        loadConvs();
+      } catch (err) { alert('创建会话失败: ' + err); }
+    };
+
+    // 立即刷一次（首屏），然后每 2 秒轮询。
+    // Promise.all 三个并行；任一失败只警告不打断——server 没起时页面不至于白屏死循环。
+    async function tick() {
+      try {
+        await Promise.all([loadConvs(), loadTeam(), loadMessages(), loadAgents()]);
+      } catch (err) { console.warn('轮询失败（server 没起？）', err); }
+    }
+    tick();
+    setInterval(tick, 2000); // 2 秒轮询：纯本地读，零 token 消耗
+  </script>
+</body>
+</html>

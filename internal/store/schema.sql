@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS issues (
 CREATE TABLE IF NOT EXISTS task_queue (
   id           TEXT PRIMARY KEY,               -- 队列项的唯一 id
   issue_id     TEXT NOT NULL REFERENCES issues(id),  -- 关联哪个任务（外键）
-  status       TEXT NOT NULL DEFAULT 'queued', -- queued|dispatched|running|completed|failed|cancelled
+  status       TEXT NOT NULL DEFAULT 'queued', -- queued|dispatched|running|completed|failed|blocked|cancelled
   attempts     INTEGER NOT NULL DEFAULT 0,     -- 尝试执行了几次
   dedup_sha    TEXT,                           -- 防重复：相同任务只入队一次
   claim_token  TEXT,                           -- 认领凭证：谁认领了，谁就能完成
@@ -70,4 +70,14 @@ CREATE TABLE IF NOT EXISTS messages (
   content         TEXT NOT NULL,                               -- 消息正文
   task_id         TEXT,                                        -- 由这条消息触发的工作（issues.id），普通消息为 NULL
   created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 第 8 张表：消息 ↔ 任务 关联表（M8 多 @：一条消息可触发多个任务）
+-- 为什么需要它：messages.task_id 只能存一个任务 id。一条消息 @ 多人 → 触发多个任务，
+-- 一个字段装不下多个值。关系建模的正解是拆一张"关联表"：
+-- 把"消息 → 任务"的 1 对多，拆成两张 1 对多（消息→关联行、任务→关联行），中间用这张表连接。
+CREATE TABLE IF NOT EXISTS message_tasks (
+  message_id TEXT NOT NULL REFERENCES messages(id),  -- 消息 id（外键指向 messages）
+  task_id    TEXT NOT NULL REFERENCES issues(id),    -- 任务 id（外键指向 issues）
+  PRIMARY KEY (message_id, task_id)                  -- 组合主键：同一个(消息,任务)组合最多出现一次
 );

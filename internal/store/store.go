@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -88,7 +89,7 @@ func (s *Store) ListAgents(ctx context.Context) ([]Agent, error) {
 	}
 	defer rows.Close()
 
-	var agents []Agent
+	agents := []Agent{} // 空 slice（不是 nil！）：JSON 序列化出 []，前端遍历不炸
 	for rows.Next() {
 		var a Agent
 		if err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.Engine, &a.CreatedAt); err != nil {
@@ -178,11 +179,55 @@ func (s *Store) ListConversations(ctx context.Context) ([]Conversation, error) {
 	}
 	defer rows.Close()
 
-	var convs []Conversation
+	convs := []Conversation{}
 	for rows.Next() {
 		var c Conversation
 		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.CreatedAt); err != nil {
 			return nil, fmt.Errorf("读取会话行失败: %w", err)
+		}
+		convs = append(convs, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历会话失败: %w", err)
+	}
+	return convs, nil
+}
+
+// ConversationWithMembers 会话 + 成员名字列表（前端左栏显示用）。
+// 嵌入 Conversation：它自动"拥有" Conversation 的全部字段（ID/Name/Type/CreatedAt），
+// 序列化成 JSON 时这些字段会平铺在外层，外面再加一个 Members 数组。
+type ConversationWithMembers struct {
+	Conversation
+	Members []string // 成员名字（'小王'、'小李'…）；没有成员的会话为空
+}
+
+// ListConversationsWithMembers 列出所有会话，每个会话带成员名字列表。
+// 为什么用 GROUP_CONCAT 而不用"先查会话再逐个查成员"？
+// 后者是 N+1 查询（1 次会话 + N 次成员查询）；GROUP_CONCAT 把"一个会话的所有成员名"
+// 拼成一个字符串 '小王、小李'，一条 JOIN 全拿到。
+// LEFT JOIN 保证：没成员的会话也有一行（成员是 NULL），不会漏会话。
+func (s *Store) ListConversationsWithMembers(ctx context.Context) ([]ConversationWithMembers, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT c.id, c.name, c.type, c.created_at,
+		        GROUP_CONCAT(a.name, '、' ORDER BY a.rowid)
+		 FROM conversations c
+		 LEFT JOIN conversation_members cm ON cm.conversation_id = c.id
+		 LEFT JOIN agents a ON a.id = cm.agent_id
+		 GROUP BY c.id ORDER BY c.created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("查询会话失败: %w", err)
+	}
+	defer rows.Close()
+
+	convs := []ConversationWithMembers{}
+	for rows.Next() {
+		var c ConversationWithMembers
+		var members sql.NullString // 没成员时 GROUP_CONCAT 结果是 NULL
+		if err := rows.Scan(&c.ID, &c.Name, &c.Type, &c.CreatedAt, &members); err != nil {
+			return nil, fmt.Errorf("读取会话行失败: %w", err)
+		}
+		if members.Valid && members.String != "" {
+			c.Members = strings.Split(members.String, "、") // '小王、小李' → [小王 小李]
 		}
 		convs = append(convs, c)
 	}
@@ -208,14 +253,48 @@ func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, 
 	return &c, nil
 }
 
+// ListConversationMembers 返回一个会话里的所有 agent 成员（按名字排序）。
+// 单聊 = 1 人、群聊 = N 人；人类是隐式所有者，不在 members 表里。
+// M8 触发逻辑要用它：单聊直接派给唯一成员；群聊校验 @ 的人是否在群里。
+func (s *Store) ListConversationMembers(ctx context.Context, conversationID string) ([]Agent, error) {
+	// conversation_members 只有两个 id（conversation_id + agent_id），要拿员工完整信息必须 JOIN agents
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT a.id, a.name, a.role, a.description, a.engine, a.created_at
+		 FROM conversation_members cm
+		 JOIN agents a ON a.id = cm.agent_id
+		 WHERE cm.conversation_id = ?
+		 ORDER BY a.rowid`, conversationID)
+	if err != nil {
+		return nil, fmt.Errorf("查询会话成员失败: %w", err)
+	}
+	defer rows.Close()
+
+	members := []Agent{} // 空 slice（不是 nil）：JSON 出 []，前端 for..of 不炸（M6 教学点复习）
+	for rows.Next() {
+		var a Agent
+		if err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.Engine, &a.CreatedAt); err != nil {
+			return nil, fmt.Errorf("读取成员行失败: %w", err)
+		}
+		members = append(members, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历成员失败: %w", err)
+	}
+	return members, nil
+}
+
 // GetMessageByTask 按任务 id 找触发它的消息。
-// agent 完成任务后用它反查"往哪个会话回消息"：消息.task_id 关联了任务。
+// agent 完成任务后用它反查"往哪个会话回消息"。M8 起从 message_tasks 关联表反查
+// （任务可能被多条消息/多个 agent 关联，但"触发它"的那条 user 消息是唯一可反查的目标）。
 func (s *Store) GetMessageByTask(ctx context.Context, issueID string) (*Message, error) {
 	var m Message
 	var taskID sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, conversation_id, sender_type, sender_id, content, task_id, created_at
-		 FROM messages WHERE task_id = ? ORDER BY created_at LIMIT 1`, issueID,
+		`SELECT m.id, m.conversation_id, m.sender_type, m.sender_id, m.content, m.task_id, m.created_at
+		 FROM message_tasks mt
+		 JOIN messages m ON m.id = mt.message_id
+		 WHERE mt.task_id = ?
+		 ORDER BY m.created_at LIMIT 1`, issueID,
 	).Scan(&m.ID, &m.ConversationID, &m.SenderType, &m.SenderID, &m.Content, &taskID, &m.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil // 没找到触发消息（任务可能是 API 直接建的，不是消息触发的）
@@ -252,6 +331,20 @@ func (s *Store) SendMessage(ctx context.Context, conversationID, senderType, sen
 	return m, nil
 }
 
+// AttachTasks 把一组任务关联到一条消息（写 message_tasks 关联表）。
+// 场景：一条消息 @ 多人 → 触发多个任务，每个任务都要能反查到这条消息。
+// OR IGNORE：组合主键已存在就跳过（重复挂同一个任务不报错），幂等。
+func (s *Store) AttachTasks(ctx context.Context, messageID string, taskIDs []string) error {
+	for _, taskID := range taskIDs {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT OR IGNORE INTO message_tasks (message_id, task_id) VALUES (?, ?)`,
+			messageID, taskID); err != nil {
+			return fmt.Errorf("关联任务失败: %w", err)
+		}
+	}
+	return nil
+}
+
 // ListMessages 取一个会话的消息流（旧的在前，按时间排）
 func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Message, error) {
 	rows, err := s.db.QueryContext(ctx,
@@ -262,7 +355,7 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Mess
 	}
 	defer rows.Close()
 
-	var msgs []Message
+	msgs := []Message{}
 	for rows.Next() {
 		var m Message
 		var taskID sql.NullString // task_id 可空：普通消息没有关联任务
@@ -276,6 +369,54 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Mess
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历消息失败: %w", err)
+	}
+	return msgs, nil
+}
+
+// GetConversationContext 取"某任务来源会话"的最近 limit 条消息，给 agent 当干活背景。
+// 链路：任务 id → message_tasks 反查触发消息 → 拿到会话 id → 取该会话最近 limit 条。
+// 任务不是消息触发的（API 直接建）→ 返回空 slice，没有会话背景可注入。
+func (s *Store) GetConversationContext(ctx context.Context, issueID string, limit int) ([]Message, error) {
+	// ① 反查来源会话（拿到 conversation_id）
+	src, err := s.GetMessageByTask(ctx, issueID)
+	if err != nil {
+		return nil, err
+	}
+	if src == nil {
+		return []Message{}, nil // 任务不是消息来的，没有背景
+	}
+
+	// ② 取最近 limit 条。"最近 N 条"的经典套路：
+	//    DESC（时间倒序，新的在前）→ LIMIT N 截取 → 再反转回"旧的在前"。
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, conversation_id, sender_type, sender_id, content, task_id, created_at
+		 FROM messages WHERE conversation_id = ?
+		 ORDER BY created_at DESC LIMIT ?`, src.ConversationID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("查询会话背景失败: %w", err)
+	}
+	defer rows.Close()
+
+	msgs := []Message{}
+	for rows.Next() {
+		var m Message
+		var taskID sql.NullString
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderType, &m.SenderID, &m.Content, &taskID, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("读取背景消息失败: %w", err)
+		}
+		if taskID.Valid {
+			m.TaskID = taskID.String
+		}
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历背景消息失败: %w", err)
+	}
+
+	// ③ 反转顺序（双指针从两端往中间走，逐个交换）：DESC 取出来新的在前，
+	//    倒回"旧的在前"，prompt 里对话才顺（就像人从前往后读聊天记录）
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
 	return msgs, nil
 }
@@ -348,11 +489,17 @@ func (s *Store) EnqueueTask(ctx context.Context, issueID string) error {
 	return nil
 }
 
+// MaxAttempts 一条任务最多尝试执行几次；超过就上报 blocked 等人类介入。
+// 为什么设上限？每次重试 = 再调一次 claude = 再花一次 token。技术性失败重试几次合理，
+// 但无限重试只会无限烧钱——所以到点上报，让人看看到底卡在哪。
+const MaxAttempts = 3
+
 // QueuedTask 是一次认领到手的"活"：worker 凭它干活，并凭 ClaimToken 汇报结果
 type QueuedTask struct {
 	ID         string // 队列项 id（task_queue.id）
 	IssueID    string // 对应哪条任务（issues.id）
 	ClaimToken string // 认领凭证：只有持有它才能标记完成/失败
+	Attempts   int    // 已经尝试过几次（M5：重试/上报 的分界依据）
 }
 
 // ClaimTask 尝试认领一条 queued 任务。
@@ -363,8 +510,9 @@ func (s *Store) ClaimTask(ctx context.Context, workerID, assigneeID string) (*Qu
 	// 注意：assignee_id 在 issues 表，不在 task_queue，所以要 JOIN 连表查
 	// 依赖过滤（协作任务）：没依赖直接放行；有依赖必须等上游 completed
 	var id, issueID string
+	var attempts int // M5：顺带读出"已尝试几次"，FailTask 判断重试/上报要用
 	err := s.db.QueryRowContext(ctx,
-		`SELECT t.id, t.issue_id FROM task_queue t
+		`SELECT t.id, t.issue_id, t.attempts FROM task_queue t
 		 JOIN issues i ON i.id = t.issue_id
 		 WHERE t.status = 'queued' AND i.assignee_id = ?
 		   AND (i.depends_on IS NULL
@@ -372,7 +520,7 @@ func (s *Store) ClaimTask(ctx context.Context, workerID, assigneeID string) (*Qu
 		                   WHERE d.issue_id = i.depends_on AND d.status = 'completed'))
 		 ORDER BY t.created_at LIMIT 1`,
 		assigneeID,
-	).Scan(&id, &issueID)
+	).Scan(&id, &issueID, &attempts)
 	if err == sql.ErrNoRows {
 		return nil, nil // 没有派给我的活
 	}
@@ -400,7 +548,7 @@ func (s *Store) ClaimTask(ctx context.Context, workerID, assigneeID string) (*Qu
 		return nil, nil // 没抢到：别人更快，这一轮空手而归
 	}
 
-	return &QueuedTask{ID: id, IssueID: issueID, ClaimToken: claimToken}, nil
+	return &QueuedTask{ID: id, IssueID: issueID, ClaimToken: claimToken, Attempts: attempts}, nil
 }
 
 // CompleteTask 凭认领凭证，把任务标记为已完成。
@@ -425,25 +573,122 @@ func (s *Store) CompleteTask(ctx context.Context, task *QueuedTask) error {
 	return nil
 }
 
-// FailTask 凭认领凭证，把任务标记为失败，并记下错误原因。
-func (s *Store) FailTask(ctx context.Context, task *QueuedTask, errMsg string) error {
+// FailTask 凭认领凭证标记任务失败，并自动处理"重试 or 上报"。
+// 返回字符串是任务的最终状态：
+//   "queued"  → 这次失败还能重试（attempts+1 还没到 MaxAttempts），已回退排队
+//   "blocked" → 重试耗尽，需要人类介入
+//
+// 一条 UPDATE 原子完成三件事：
+//   1) attempts = attempts + 1                          计数自增
+//   2) CASE WHEN 决定这次失败去 queued（回退重试）还是 blocked（上报人）
+//   3) 回退时把 claim_token / worker_id 清成 NULL       旧凭证作废，重新排队等再认领
+//
+// 为什么不用"Go 先查 attempts，再决定回退 or 上报"两段式？
+// 两段式中间可能有别的进程插入写，计数就失真了。CASE WHEN 把"还有没有重试额度"
+// 的判断下沉到 SQL，计数 + 分支在一条 UPDATE 里原子完成——让数据库帮你做决策。
+// 注意：Go 里计算返回状态用的判断和 SQL 里的 CASE 是同一句，改动必须两边同步。
+func (s *Store) FailTask(ctx context.Context, task *QueuedTask, errMsg string) (string, error) {
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE task_queue
-		 SET status = 'failed', error = ?, finished_at = ?
+		 SET status = CASE WHEN attempts + 1 < ? THEN 'queued' ELSE 'blocked' END,
+		     attempts = attempts + 1,
+		     claim_token = NULL,
+		     worker_id = NULL,
+		     error = ?,
+		     finished_at = ?
 		 WHERE id = ? AND claim_token = ? AND status IN ('dispatched', 'running')`,
-		errMsg, time.Now(), task.ID, task.ClaimToken,
+		MaxAttempts, errMsg, time.Now(), task.ID, task.ClaimToken,
 	)
 	if err != nil {
-		return fmt.Errorf("标记失败失败: %w", err)
+		return "", fmt.Errorf("标记失败失败: %w", err)
 	}
 	affected, err := res.RowsAffected()
 	if err != nil {
-		return fmt.Errorf("读取失败结果失败: %w", err)
+		return "", fmt.Errorf("读取失败结果失败: %w", err)
 	}
 	if affected == 0 {
-		return fmt.Errorf("标记失败失败: 凭证不匹配或任务已被处理 (id=%s)", task.ID)
+		return "", fmt.Errorf("标记失败失败: 凭证不匹配或任务已被处理 (id=%s)", task.ID)
+	}
+
+	// 算返回状态：和 SQL 的 CASE 同一句判断（attempts+1 达到上限 → blocked）
+	finalStatus := "queued"
+	if task.Attempts+1 >= MaxAttempts {
+		finalStatus = "blocked"
+	}
+	return finalStatus, nil
+}
+
+// BlockTask 把任务标记为 blocked：需要人类介入，不再重试。
+// 两个来源（M5）：① claude 主动回答"我无法完成：<原因>"，② 重试耗尽。
+// 注意和 FailTask 的区别——FailTask 会先试着重试；BlockTask 是"这个重试也没意义，
+// 直接上报"，比如 claude 明说自己做不到（再重试 = 再烧一次 token 得到同样答案）。
+// reason 是给人类看的说明，存在 error 列里。
+func (s *Store) BlockTask(ctx context.Context, task *QueuedTask, reason string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE task_queue
+		 SET status = 'blocked', error = ?, finished_at = ?
+		 WHERE id = ? AND claim_token = ? AND status IN ('dispatched', 'running')`,
+		reason, time.Now(), task.ID, task.ClaimToken,
+	)
+	if err != nil {
+		return fmt.Errorf("标记 blocked 失败: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取 blocked 结果失败: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("标记 blocked 失败: 凭证不匹配或任务已被处理 (id=%s)", task.ID)
 	}
 	return nil
+}
+
+// CascadeBlock 上游 failed/blocked 时，把依赖它的下游（还在 queued 排队的）级联标成 blocked。
+// 为什么需要：认领有 EXISTS 检查（上游必须 completed 才能领）。上游卡死了，
+// 下游永远等不到，会静默卡在 queued 没人知道。级联把它变成显式的 blocked + reason 上报人。
+//
+// 级联会层层传导（A 依赖 B、B 依赖 C；C 卡死 → B 被级联 blocked → A 也要被级联），
+// 所以是"逐层循环"：处理完一层，拿到的下游当下一层的"上游"，直到某层没有新下游为止。
+// 环（A↔B 互相依赖）不会死循环：被标过 blocked 的下游 status 不再是 'queued'，下一轮 WHERE 不命中。
+//
+// 返回被级联标成 blocked 的总数。
+func (s *Store) CascadeBlock(ctx context.Context, upstreamIssueID string, reason string) (int64, error) {
+	var total int64
+	layer := []string{upstreamIssueID} // 这一层要检查"谁依赖它们"
+	for len(layer) > 0 {
+		var next []string
+		for _, up := range layer {
+			// UPDATE + RETURNING：把"标 blocked"和"拿到被标的任务 id"合进一条 SQL。
+			// RETURNING 是 SQLite 3.35+ 的语法：UPDATE 也能返回被更新行的列。
+			// 不 RETURNING 的话，得先 SELECT 再 UPDATE 两段式，中间可能被别的进程插一刀。
+			rows, err := s.db.QueryContext(ctx,
+				`UPDATE task_queue
+				 SET status = 'blocked', error = ?, finished_at = ?
+				 WHERE status = 'queued'
+				   AND issue_id IN (SELECT id FROM issues WHERE depends_on = ?)
+				 RETURNING issue_id`,
+				reason, time.Now(), up,
+			)
+			if err != nil {
+				return total, fmt.Errorf("级联 blocked 失败: %w", err)
+			}
+			for rows.Next() {
+				var issueID string
+				if err := rows.Scan(&issueID); err != nil {
+					rows.Close()
+					return total, fmt.Errorf("读取级联结果失败: %w", err)
+				}
+				next = append(next, issueID) // 这批新 blocked 的下游，作为下一层的"上游"
+				total++
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return total, fmt.Errorf("遍历级联结果失败: %w", err)
+			}
+		}
+		layer = next // 继续往下一层找
+	}
+	return total, nil
 }
 
 // StartTask 标记任务"正式开始执行"：status → running，并记录开始时间。
@@ -490,7 +735,7 @@ func (s *Store) ListQueue(ctx context.Context) ([]QueueItem, error) {
 	}
 	defer rows.Close()
 
-	var items []QueueItem
+	items := []QueueItem{}
 	for rows.Next() {
 		var it QueueItem
 		if err := rows.Scan(&it.ID, &it.IssueID, &it.Status, &it.Attempts, &it.WorkerID, &it.Error, &it.CreatedAt, &it.StartedAt, &it.FinishedAt); err != nil {
@@ -582,7 +827,7 @@ func (s *Store) ListRuns(ctx context.Context) ([]RunRecord, error) {
 	}
 	defer rows.Close()
 
-	var runs []RunRecord
+	runs := []RunRecord{}
 	for rows.Next() {
 		var r RunRecord
 		if err := rows.Scan(&r.ID, &r.TaskID, &r.ExitCode, &r.Output, &r.DurationMs, &r.CreatedAt); err != nil {
@@ -606,7 +851,7 @@ func (s *Store) ListIssues(ctx context.Context) ([]Issue, error) {
 	}
 	defer rows.Close()
 
-	var issues []Issue
+	issues := []Issue{}
 	for rows.Next() {
 		var i Issue
 		// assignee_id / depends_on 可空，先扫 NullString 再取
@@ -626,4 +871,48 @@ func (s *Store) ListIssues(ctx context.Context) ([]Issue, error) {
 		return nil, fmt.Errorf("遍历结果失败: %w", err)
 	}
 	return issues, nil
+}
+
+// AgentStatus 一个 agent 的当前状态（前端状态灯用）
+type AgentStatus struct {
+	ID     string
+	Name   string
+	Role   string
+	Status string // running | blocked | idle
+}
+
+// TeamStatus 返回每个 agent 的当前状态（前端"团队状态灯"轮询用）。
+// status 看该 agent 最新一条"还没结束"的任务：
+//   running/dispatched → 在干活（绿灯）
+//   blocked            → 卡住了（红灯）
+//   都没有             → 空闲（灰灯）
+// 教学点一（相关子查询）：子查询里引用外层 a.id——"这个 agent 的最新任务状态是什么"。
+// 教学点二（COALESCE 兜底）：子查询查不到行时返回 NULL（agent 从没干过活），
+//   COALESCE 把它替换成默认值 'idle'——NULL 不会"漏到"前端。
+func (s *Store) TeamStatus(ctx context.Context) ([]AgentStatus, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT a.id, a.name, a.role,
+		        COALESCE((SELECT t.status FROM task_queue t
+		                  JOIN issues i ON i.id = t.issue_id
+		                  WHERE i.assignee_id = a.id
+		                    AND t.status IN ('running', 'dispatched', 'blocked')
+		                  ORDER BY t.created_at DESC LIMIT 1), 'idle') AS status
+		 FROM agents a ORDER BY a.created_at`)
+	if err != nil {
+		return nil, fmt.Errorf("查询团队状态失败: %w", err)
+	}
+	defer rows.Close()
+
+	agents := []AgentStatus{}
+	for rows.Next() {
+		var a AgentStatus
+		if err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Status); err != nil {
+			return nil, fmt.Errorf("读取团队状态失败: %w", err)
+		}
+		agents = append(agents, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历团队状态失败: %w", err)
+	}
+	return agents, nil
 }

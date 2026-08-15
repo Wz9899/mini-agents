@@ -27,6 +27,12 @@ func main() {
 	mux.HandleFunc("GET /api/conversations", handleListConversations(s))
 	mux.HandleFunc("POST /api/conversations/{id}/messages", handleCreateMessage(s))
 	mux.HandleFunc("GET /api/conversations/{id}/messages", handleListMessages(s))
+	mux.HandleFunc("GET /api/team", handleTeam(s)) // 团队状态：前端状态灯轮询
+
+	// 2.5 前端静态文件（M6 飞书式界面）：web/ 目录按"文件系统"暴露。
+	// 为什么用 "GET /"？它是兜底路由——ServeMux 永远选"最长匹配"，
+	// 所以 /api/... 走上面注册的精确路由，剩下的（如 / 和 /index.html）才落进这里。
+	mux.Handle("GET /", http.FileServer(http.Dir("web")))
 
 	// 3. 启动 HTTP 服务，监听 8080 端口
 	log.Println("服务已启动: http://localhost:8080")
@@ -125,8 +131,9 @@ func handleCreateAgent(s *store.Store) http.HandlerFunc {
 			http.Error(w, "请求体不是合法 JSON", http.StatusBadRequest)
 			return
 		}
-		if req.Name == "" || req.Role == "" {
-			http.Error(w, "name 和 role 不能为空", http.StatusBadRequest)
+		// 只要求名字：role（职责）允许留空——留空 = 无预设职责的通用员工
+		if req.Name == "" {
+			http.Error(w, "name 不能为空", http.StatusBadRequest)
 			return
 		}
 
@@ -225,10 +232,11 @@ func handleCreateConversation(s *store.Store) http.HandlerFunc {
 	}
 }
 
-// handleListConversations 返回一个"列出所有会话"的处理函数
+// handleListConversations 返回一个"列出所有会话（带成员）"的处理函数。
+// 用带成员的版本：前端左栏要显示每个会话里有谁、以及聚合状态灯。
 func handleListConversations(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		convs, err := s.ListConversations(r.Context())
+		convs, err := s.ListConversationsWithMembers(r.Context())
 		if err != nil {
 			http.Error(w, "查询失败: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -239,13 +247,29 @@ func handleListConversations(s *store.Store) http.HandlerFunc {
 	}
 }
 
+// handleTeam 返回一个"团队状态"的处理函数：每个 agent + 当前状态（前端状态灯轮询用）
+func handleTeam(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		status, err := s.TeamStatus(r.Context())
+		if err != nil {
+			http.Error(w, "查询失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	}
+}
+
 // handleCreateMessage 返回一个"往会话发消息"的处理函数。
-// @解析和触发任务是下一课（M4.5-4）的事，这步先做"纯发消息"。
+// M8 触发语义（社交软件式）：
+//   单聊：不解析 @，直接派活给聊天对象（找员工就是为了让他干活）；
+//   群聊：必须 @ 才触发干活，且只能 @ 群成员（支持一条消息 @ 多人）。
 func handleCreateMessage(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		convID := r.PathValue("id") // 路由里的 {id} 参数
 
-		// 先校验会话存在，别把消息写进不存在的会话
+		// ① 先校验会话存在，别把消息写进不存在的会话
 		conv, err := s.GetConversation(r.Context(), convID)
 		if err != nil {
 			http.Error(w, "查询会话失败: "+err.Error(), http.StatusInternalServerError)
@@ -268,37 +292,78 @@ func handleCreateMessage(s *store.Store) http.HandlerFunc {
 			return
 		}
 
-		// 2. @解析：消息里 @ 到哪位员工，就触发哪位员工干活
-		// 遍历员工表，看消息里有没有 "@员工名"（中文名字用字符串匹配，不用正则）
-		agents, err := s.ListAgents(r.Context())
-		if err != nil {
-			http.Error(w, "查询员工失败: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		var who *store.Agent
-		for i := range agents {
-			if strings.Contains(req.Content, "@"+agents[i].Name) {
-				who = &agents[i]
-				break
+		// ② 决定"派给谁干活"——单聊和群聊是两套语义
+		var targets []store.Agent // 要触发干活的人（0 个 = 只聊天不派活）
+		if conv.Type == "group" {
+			// 群聊：必须 @ 才触发。先解析内容里 @ 到了哪些员工，再校验"都在群里"
+			all, err := s.ListAgents(r.Context())
+			if err != nil {
+				http.Error(w, "查询员工失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			var mentioned []store.Agent
+			for i := range all {
+				// 不 break！一条消息可以 @ 多人，全部收集
+				if strings.Contains(req.Content, "@"+all[i].Name) {
+					mentioned = append(mentioned, all[i])
+				}
+			}
+			// 群成员校验：@ 的人必须在群里（社交软件语义：群里只能点到群里的人）
+			members, err := s.ListConversationMembers(r.Context(), convID)
+			if err != nil {
+				http.Error(w, "查询会话成员失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			inGroup := map[string]bool{}
+			for _, m := range members {
+				inGroup[m.ID] = true
+			}
+			for _, ag := range mentioned {
+				if !inGroup[ag.ID] {
+					http.Error(w, ag.Name+" 不在这个会话里，无法 @（请先把他拉进群）", http.StatusBadRequest)
+					return
+				}
+			}
+			targets = mentioned // 校验都过了，@ 到谁谁干活（多 @ 全触发）
+		} else {
+			// 单聊：不解析 @，直接派给唯一成员。整条消息就是任务内容。
+			members, err := s.ListConversationMembers(r.Context(), convID)
+			if err != nil {
+				http.Error(w, "查询会话成员失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if len(members) > 0 {
+				targets = append(targets, members[0])
 			}
 		}
 
-		// 3. 触发：@ 到员工 → 创建任务（assignee=他）+ 自动入队，消息带上 task_id 关联
-		taskID := ""
-		if who != nil {
-			issue, err := s.CreateIssue(r.Context(), req.Content, req.Content, who.ID, "")
+		// ③ 创建任务：每个 target 一个（多 @ = 多个任务），收集任务 id
+		taskIDs := []string{}
+		for i := range targets {
+			issue, err := s.CreateIssue(r.Context(), req.Content, req.Content, targets[i].ID, "")
 			if err != nil {
 				http.Error(w, "触发任务失败: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
-			taskID = issue.ID
+			taskIDs = append(taskIDs, issue.ID)
 		}
 
-		// 4. 人类发消息：sender_type=user，sender_id='me'（人类是隐式所有者）
-		msg, err := s.SendMessage(r.Context(), convID, "user", "me", req.Content, taskID)
+		// ④ 人类发消息：sender_type=user，sender_id='me'（人类是隐式所有者）
+		// 主任务写 messages.task_id（兼容旧逻辑/前端展示），全部任务走 message_tasks 关联表
+		primary := ""
+		if len(taskIDs) > 0 {
+			primary = taskIDs[0]
+		}
+		msg, err := s.SendMessage(r.Context(), convID, "user", "me", req.Content, primary)
 		if err != nil {
 			http.Error(w, "发送消息失败: "+err.Error(), http.StatusInternalServerError)
 			return
+		}
+		if len(taskIDs) > 0 {
+			if err := s.AttachTasks(r.Context(), msg.ID, taskIDs); err != nil {
+				http.Error(w, "关联任务失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
