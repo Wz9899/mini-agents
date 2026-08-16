@@ -156,6 +156,82 @@ func (s *Store) GetAgent(ctx context.Context, name string) (*Agent, error) {
 	return &a, nil
 }
 
+// GetAgentByID 按 id 查员工；找不到返回 (nil, nil)。
+// agent 进程用它做身份热更新：员工改名后不需要重启进程，下一轮按 id 重新读取即可。
+func (s *Store) GetAgentByID(ctx context.Context, id string) (*Agent, error) {
+	var a Agent
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, role, description, engine, created_at FROM agents WHERE id = ?`, id,
+	).Scan(&a.ID, &a.Name, &a.Role, &a.Description, &a.Engine, &a.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查询员工失败: %w", err)
+	}
+	return &a, nil
+}
+
+// UpdateAgent 更新员工档案：支持改名、改角色、改描述。
+// 重名时返回 UNIQUE 冲突错误，由上层转成 409。
+func (s *Store) UpdateAgent(ctx context.Context, id, name, role, description string) (*Agent, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET name = ?, role = ?, description = ? WHERE id = ?`,
+		name, role, description, id,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("更新员工失败: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("读取更新结果失败: %w", err)
+	}
+	if affected == 0 {
+		return nil, fmt.Errorf("员工不存在: %s", id)
+	}
+	return s.GetAgentByID(ctx, id)
+}
+
+// DeleteAgent 硬删除员工。
+// 硬删除会清理：
+//   - 会话成员关系（conversation_members）
+//   - 个人私有知识（memory where scope='agent'）
+// 历史消息/任务/执行日志保留，但 sender/assignee 关联会变成悬空 id。
+func (s *Store) DeleteAgent(ctx context.Context, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM conversation_members WHERE agent_id = ?`, id,
+	); err != nil {
+		return fmt.Errorf("清理会话成员失败: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM memory WHERE scope = 'agent' AND agent_id = ?`, id,
+	); err != nil {
+		return fmt.Errorf("清理个人知识失败: %w", err)
+	}
+	res, err := tx.ExecContext(ctx,
+		`DELETE FROM agents WHERE id = ?`, id,
+	)
+	if err != nil {
+		return fmt.Errorf("删除员工失败: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取删除结果失败: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("员工不存在: %s", id)
+	}
+
+	return tx.Commit()
+}
+
+
 // Conversation 代表一个会话（对应 conversations 表：direct 单聊 / group 群聊）
 type Conversation struct {
 	ID        string
@@ -289,6 +365,30 @@ func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, 
 	}
 	return &c, nil
 }
+
+// RenameConversation 修改会话名称（群聊改名/单聊显示名由前端控制）。
+// 为什么不沿用 RowsAffected()==0 判断"会话不存在"？
+// RowsAffected 返回"实际变更的行数"，值没变的 UPDATE 也算 0——比如给会话改一个
+// 相同的名字，SQLite 不会真的写，返回 0。此时"会话存在但没变化"和"会话不存在"
+// 都表现为 0，用 RowsAffected 判断会把前者误报成后者（404）。
+// 所以先 GetConversation 确认存在，再 UPDATE，两者分开判断。
+func (s *Store) RenameConversation(ctx context.Context, id, name string) error {
+	existing, err := s.GetConversation(ctx, id)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return fmt.Errorf("会话不存在: %s", id)
+	}
+
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE conversations SET name = ? WHERE id = ?`, name, id,
+	); err != nil {
+		return fmt.Errorf("修改会话名失败: %w", err)
+	}
+	return nil
+}
+
 
 // ListConversationMembers 返回一个会话里的所有 agent 成员（按名字排序）。
 // 单聊 = 1 人、群聊 = N 人；人类是隐式所有者，不在 members 表里。

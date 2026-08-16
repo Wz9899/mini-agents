@@ -38,6 +38,8 @@ func main() {
 	// 创建执行器：按档案里的 engine 字段挑引擎（claude/pi/deepseek/fake）
 	runner := agent.NewEngine(me.Engine)
 	log.Printf("🧑💻 %s [引擎:%s] 开工: %s", identityLabel(me), me.Engine, me.ID)
+	agentID := me.ID        // 进程身份锚点用 id，改名后仍能按 id 找到自己
+	currentEngine := me.Engine
 
 	// 启动时先回收一次孤儿任务（进程被杀残留的 dispatched/running）
 	ctx := context.Background()
@@ -54,6 +56,26 @@ func main() {
 		} else if n > 0 {
 			log.Printf("🧹 回收孤儿任务 %d 条", n)
 		}
+
+		// 身份热更新：每轮按 id 重新读取，员工改名/改角色/改引擎后无需重启进程。
+		fresh, err := s.GetAgentByID(ctx, agentID)
+		if err != nil {
+			log.Printf("⚠️  刷新身份失败: %v", err)
+		} else if fresh == nil {
+			log.Printf("🛑 员工 %s 已被删除，进程退出", agentID)
+			return
+		} else {
+			if fresh.Name != me.Name {
+				log.Printf("👤 员工身份已更新: %s -> %s", me.Name, fresh.Name)
+			}
+			me = fresh
+			if me.Engine != currentEngine {
+				runner = agent.NewEngine(me.Engine)
+				currentEngine = me.Engine
+				log.Printf("🧩 引擎已切换: %s", me.Engine)
+			}
+		}
+
 
 		worked := runOnce(s, runner, me)
 		if !worked {

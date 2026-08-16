@@ -16,10 +16,12 @@
 - **业务状态同步**：`issues.status` 随流水线实时更新（`todo / in_progress / done / blocked`）
 - **乐观锁认领**：一条 `UPDATE ... WHERE status='queued'` 原子完成"抢单 + 标记"，多 worker 并发也不重复执行
 - **幂等汇报**：`claim_token` 凭证 + 状态校验，重复调用不会搞坏状态
-- **多 Agent**：`cmd/agent -name 小王` 启动员工进程，只认领指派给自己的任务
+- **多 Agent**：`cmd/agent -name 小王` 启动员工进程，只认领指派给自己的任务；改名后无需重启进程
+- **自动拉起**：单聊发消息时自动启动对应 agent 进程（server 通过 `-agent-cmd` 配置命令）
 - **真实 Agent 执行**：worker 调用 `claude -p` 完成任务，带超时保护；支持多引擎（claude / pi / fake）
 - **可靠性**：失败自动重试，耗尽 `blocked` 上报；孤儿任务自动回收
 - **双层知识库**：团队共享 + 个人私有，agent 执行前自动注入（M7）
+- **员工管理**：支持员工改名、硬删除；群聊改名；浅色主题；输入框内手动 @ 成员
 - **全程记账**：每次执行的结果 / 耗时 / 退出码写入 `agent_runs`，可追溯
 - **零 CGO**：纯 Go 驱动（`modernc.org/sqlite`），跨平台，单机一键运行
 
@@ -80,19 +82,22 @@ mini-agents/
 git clone <你的仓库地址>
 cd mini-agents
 
-# 2. 编译（首次会自动下载依赖）
-go build ./...
+# 2. 编译到 bin/（首次会自动下载依赖）
+#    注意：要编译到 bin/ 而不是 `go build ./...`——server 自动拉起 agent 默认找 bin/agent.exe
+go build -o bin/ ./cmd/...
 
-# 3. 终端 A：启动 HTTP 服务（默认只监听本机）
-go run ./cmd/server
+# 3. 终端 A：启动 HTTP 服务（默认只监听本机；必须在项目根目录运行）
+./bin/server.exe                 # Windows cmd 里写 bin\server.exe
 # → 服务已启动: http://127.0.0.1:8080
+#   单聊发消息时 server 会自动拉起对应 agent 进程（默认命令 bin/agent.exe）。
+#   想用其他路径/名字，加 -agent-cmd：./bin/server.exe -agent-cmd bin/agent.exe
 
-# 4. 终端 B：让员工小王入职并启动它的 agent 进程（自动认领任务并调用引擎）
+# 4. 终端 B（可选）：手动启动 agent 进程（不手动开也行——单聊发消息时 server 会自动拉起）
 curl -X POST http://127.0.0.1:8080/api/agents \
   -H "Content-Type: application/json" \
   -d '{"name":"小王","role":"前端工程师","engine":"fake"}'
 
-go run ./cmd/agent -name 小王
+./bin/agent.exe -name 小王
 ```
 
 ## 🧪 使用示例

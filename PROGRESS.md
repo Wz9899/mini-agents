@@ -127,6 +127,14 @@
 - **前端无障碍**（前端审核 P2）：消息流加 `aria-live="polite"`，输入框加 `aria-label`，状态灯加 `role="img"` + `aria-label`，让屏幕阅读器能感知新消息和员工状态
 - **M7 双层知识库落地**：`memory` 表按 `scope` 区分团队共享和个人私有；`internal/memory` 封装 Capture/Recall；`cmd/agent` 执行前用 `RecallMemoryForAgent` 把团队 + 个人知识注入 prompt；HTTP 提供 `POST/GET /api/memory`
 - **time.Time.String() 存储格式坑**（V2 RD 验证真 bug）：SQLite 存 Go time.Time 时驱动按 `time.Time.String()` 落盘，带 `m=+XX.XXXX` 单调时钟后缀。单调时钟是进程私有读数，**扫描读回时必然丢失**（从字符串恢复不了）；再把读回的时间当查询参数绑回去，格式就与库值不一致（库值多了 ` m=...` 后缀）→ 字符串比较 `created_at > ?` 把"库值比前缀相同的参数长"当成 `>`，**游标消息自己也被返回** → 增量拉取重复返回。为什么孤儿回收没踩坑？它用 `time.Now().Add()` 直接生成 cutoff（进程内带 m=，与库值格式一致）；坑只出现在"扫描恢复"的时间戳上。**当前修复**：增量拉取不再用 `created_at` 做游标，改用消息 ULID `id > ?` 判断，ULID 本身按时间有序，从根上绕开单调时钟问题；前端恢复 `?after=` 增量拉取。后续仍建议统一时间格式常量（如 `2006-01-02 15:04:05.999999999 -07:00`），避免其他地方再次踩坑
+- **员工管理**：新增 `PATCH /api/agents/{id}` 改名、`DELETE /api/agents/{id}` 硬删除；agent 进程改为按 id 每轮刷新身份，改名后无需重启
+- **自动拉起 agent**：server 增加 `-agent-cmd` 参数，单聊发消息时自动启动对应 agent 进程
+- **群聊改名**：新增 `PATCH /api/conversations/{id}`，前端标题栏“改名”按钮
+- **前端交互优化**：浅色主题、单聊标题只显示员工名、输入框内输入 `@` 弹出成员选择器
+- **函数体内不能定义函数**（V2 M8-2 真坑）：`func` 只能写在包级或方法级，函数体里只能定义**闭包**（`f := func(){}`）。把 `func ensureAgentStarted` 写进 `handleCreateMessage` 内部 → 编译报 `syntax error: unexpected name`（Go 编译器把函数名当成了表达式的一部分）
+- **RowsAffected()==0 有两种含义**（V2 M8-2 真坑）：SQLite 的 RowsAffected 返回"**实际变更**的行数"，值没变的 UPDATE（比如给会话改成相同的名字）也算 0。所以"记录不存在"和"记录在但没变化"都返回 0，用 RowsAffected 判断存在性会误判——判断存在要先 SELECT 确认，更新后是否生效再管 RowsAffected
+- **exec.Command 子进程目录继承**（V2 M8-2）：子进程默认**继承父进程的 cwd**。server 从别的目录启动时，自动拉起的 agent 继承错误目录 → 用相对路径 `mini-agents.db` 会新建空库、找不到员工档案直接退出。`exec.Cmd` 用 `cmd.Dir = os.Getwd()` 显式钉死工作目录
+- **@ 弹出 tail 前缀替换**（V2 M8-2 前端）：点成员候选时，只替换"最后一个 @ 之后、匹配上成员名的**最长前缀**"，保留用户后续输入的文字。老写法用正则把 @ 后的中英文数字整体吞掉，会把 `@小王你好` 里的"你好"也删了
 
 ## 文件清单（当前）
 
@@ -136,11 +144,11 @@ mini-agents/
   .gitignore                  ✅ 运行产物/日志/数据库文件已忽略
   docs/rd.md                  ✅ 优化 RD 文档（P0-P2 清单与方案）
   internal/store/schema.sql   ✅ 8 张表 + 业务索引 + task_queue.dispatched_at
-  internal/store/store.go     ✅ 数据层（事务化 CreateIssue/SendMessageWithTasks；issues.status 同步；RequeueStaleTasks 孤儿回收）
+  internal/store/store.go     ✅ 数据层（事务化 CreateIssue/SendMessageWithTasks；issues.status 同步；RequeueStaleTasks 孤儿回收；员工管理 UpdateAgent/DeleteAgent + 会话改名 RenameConversation）
   internal/store/store_test.go ✅ 任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收/消息事务测试
-    cmd/server/main_test.go     ✅ HTTP handler 测试（创建任务/员工/消息触发任务）
-  cmd/server/main.go          ✅ HTTP 服务（默认 127.0.0.1:8080；issues/agents/conversations/messages/team 路由 + 静态文件）
-  cmd/agent/main.go           ✅ Agent 入口（-name 认领自己的任务；孤儿回收；失败重试/上报/级联；空闲日志降噪）
+    cmd/server/main_test.go     ✅ HTTP handler 测试（创建任务/员工/消息触发/员工管理 PATCH·DELETE/会话改名）
+  cmd/server/main.go          ✅ HTTP 服务（默认 127.0.0.1:8080；issues/agents/conversations/messages/team 路由 + 静态文件；员工管理/群聊改名；单聊发消息自动拉起 agent -agent-cmd）
+  cmd/agent/main.go           ✅ Agent 入口（-name 认领自己的任务；孤儿回收；失败重试/上报/级联；空闲日志降噪；按 id 每轮刷新身份热更新）
   cmd/dump/main.go            ✅ 查看任务+队列+执行日志的小工具（调试用）
   internal/agent/runner.go    ✅ Engine 接口 + ClaudeEngine（直连 claude.exe 避编码坑；注入角色人设）
   internal/agent/pi.go        ✅ PiEngine（pi --mode rpc，JSONL 流式攒 text_delta）
@@ -148,6 +156,6 @@ mini-agents/
   internal/agent/fake.go      ✅ FakeEngine（干跑用，不调 LLM 省 token）
   internal/agent/engine.go    ✅ NewEngine 工厂（按名字选实现，多态入口）
     internal/agent/engine_test.go ✅ 引擎测试（FakeEngine + NewEngine 工厂）
-  web/index.html              ✅ M6 飞书式前端「夜间调度台」（会话列表+消息流+@chip+链式轮询+增量拉取+状态灯+无障碍；M8-1 加入职/新建会话面板）
+  web/index.html              ✅ M6 飞书式前端「夜间调度台」（会话列表+消息流+@chip+链式轮询+增量拉取+状态灯+无障碍；M8-1 加入职/新建会话面板；M8-2 员工管理/群聊改名/浅色主题/@ 弹出选择器）
   internal/memory/memory.go   ✅ M7 双层知识库（Capture/Recall/RecallForAgent 门面）
 ```

@@ -67,13 +67,13 @@ Agent 执行器（`internal/agent/`）与数据层**平级**，被 `cmd/agent` �
 |---|---|---|
 | 生命周期 | `Open` / `Close` | 打开（自动建表 + 旧库迁移）/ 关闭数据库 |
 | 工具 | `NewID` | 生成 ULID 主键 |
-| 员工 | `CreateAgent` / `ListAgents` / `GetAgent` | 入职 / 列员工 / 按名字查员工 |
+| 员工 | `CreateAgent` / `ListAgents` / `GetAgent` / `GetAgentByID` / `UpdateAgent` / `DeleteAgent` | 入职 / 列员工 / 按名字查 / 按 id 查 / 改名 / 硬删除 |
 | 任务 | `CreateIssue` / `ListIssues` / `GetIssue` | 建任务（事务写入 issues + task_queue）/ 列任务 / 按 id 取任务 |
 | 队列 | `EnqueueTask` / `ClaimTask` / `StartTask` | 入队 / 乐观锁认领（写 dispatched_at）/ 标记开工 |
 | 汇报 | `CompleteTask` / `FailTask` / `BlockTask` | 幂等完成 / 幂等失败（重试或 blocked）/ 直接 blocked，均同步 issues.status |
 | 回收 | `RequeueStaleTasks` | 回收超时的 dispatched/running 孤儿任务 |
 | 记账 | `RecordRun` / `GetLatestRun` / `ListRuns` | 写执行日志 / 读上游最近输出 / 看执行日志 |
-| 会话 | `CreateConversation` / `ListConversationsWithMembers` / `GetConversation` / `ListConversationMembers` | 会话与成员 |
+| 会话 | `CreateConversation` / `ListConversationsWithMembers` / `GetConversation` / `RenameConversation` / `ListConversationMembers` | 会话与成员、群聊改名 |
 | 消息 | `SendMessage` / `SendMessageWithTasks` / `AttachTasks` / `ListMessages` / `ListMessagesAfter` / `GetMessageByTask` / `GetConversationContext` | 消息与任务关联、增量拉取 |
 | 查看 | `ListQueue` / `TeamStatus` | 看队列 / 看团队状态 |
 | 知识库 | `CaptureMemory` / `RecallMemory` / `RecallMemoryForAgent` | M7 双层知识库：写入 / 按作用域读取 / 拼装注入文本 |

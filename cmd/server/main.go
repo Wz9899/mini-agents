@@ -5,8 +5,11 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 
 	"mini-agents/internal/store"
 )
@@ -14,6 +17,7 @@ import (
 func main() {
 	// 0. 启动参数：默认只监听本机，避免局域网内其他人访问
 	addr := flag.String("addr", "127.0.0.1:8080", "监听地址")
+	agentCmd := flag.String("agent-cmd", "bin/agent.exe", "自动拉起 agent 时使用的命令（如 bin/agent.exe 或 agent）")
 	flag.Parse()
 
 	// 1. 打开数据库（自动建表）
@@ -24,7 +28,7 @@ func main() {
 	defer s.Close()
 
 	// 2. 创建路由表，登记"哪个 URL 由哪个函数处理"
-	mux := newMux(s)
+	mux := newMux(s, *agentCmd)
 
 	// 3. 启动 HTTP 服务
 	log.Printf("服务已启动: http://%s", *addr)
@@ -37,15 +41,18 @@ func main() {
 // 为什么要抽成函数？main 和测试共用同一张路由表。
 // 测试用 httptest + mux.ServeHTTP 走真实路由，连 {id} 路径参数的解析
 // （r.PathValue）也会被一起验证——直接调 handler 函数拿不到路径参数。
-func newMux(s *store.Store) *http.ServeMux {
+func newMux(s *store.Store, agentCmd string) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/issues", handleCreateIssue(s))
 	mux.HandleFunc("GET /api/issues", handleListIssues(s))
 	mux.HandleFunc("POST /api/agents", handleCreateAgent(s))
 	mux.HandleFunc("GET /api/agents", handleListAgents(s))
+	mux.HandleFunc("PATCH /api/agents/{id}", handleUpdateAgent(s))
+	mux.HandleFunc("DELETE /api/agents/{id}", handleDeleteAgent(s))
 	mux.HandleFunc("POST /api/conversations", handleCreateConversation(s))
 	mux.HandleFunc("GET /api/conversations", handleListConversations(s))
-	mux.HandleFunc("POST /api/conversations/{id}/messages", handleCreateMessage(s))
+	mux.HandleFunc("PATCH /api/conversations/{id}", handleRenameConversation(s))
+	mux.HandleFunc("POST /api/conversations/{id}/messages", handleCreateMessage(s, agentCmd))
 	mux.HandleFunc("GET /api/conversations/{id}/messages", handleListMessages(s))
 	mux.HandleFunc("GET /api/team", handleTeam(s)) // 团队状态：前端状态灯轮询
 	mux.HandleFunc("POST /api/memory", handleCreateMemory(s)) // M7 知识库：写入团队/个人知识
@@ -195,6 +202,93 @@ func handleListAgents(s *store.Store) http.HandlerFunc {
 		json.NewEncoder(w).Encode(agents)
 	}
 }
+
+// handleUpdateAgent 修改员工档案（改名/改角色/改描述）。
+// PATCH /api/agents/{id} body: {"name":"新名字","role":"新角色","description":"新描述"}
+func handleUpdateAgent(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+
+		var req struct {
+			Name        string `json:"name"`
+			Role        string `json:"role"`
+			Description string `json:"description"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体不是合法 JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Name == "" {
+			http.Error(w, "name 不能为空", http.StatusBadRequest)
+			return
+		}
+
+		agent, err := s.UpdateAgent(r.Context(), id, req.Name, req.Role, req.Description)
+		if err != nil {
+			if strings.Contains(err.Error(), "UNIQUE") {
+				http.Error(w, "重名: agents 表里已有 "+req.Name, http.StatusConflict)
+				return
+			}
+			if strings.Contains(err.Error(), "员工不存在") {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, "更新员工失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(agent)
+	}
+}
+
+// handleDeleteAgent 硬删除员工。
+// DELETE /api/agents/{id}
+func handleDeleteAgent(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if err := s.DeleteAgent(r.Context(), id); err != nil {
+			if strings.Contains(err.Error(), "员工不存在") {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, "删除员工失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// handleRenameConversation 修改会话名称（群聊改名）。
+// PATCH /api/conversations/{id} body: {"name":"新会话名"}
+func handleRenameConversation(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+
+		var req struct {
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体不是合法 JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Name == "" {
+			http.Error(w, "name 不能为空", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.RenameConversation(r.Context(), id, req.Name); err != nil {
+			if strings.Contains(err.Error(), "会话不存在") {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			http.Error(w, "修改会话名失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
 
 // handleCreateConversation 返回一个"建会话（拉群/开单聊）"的处理函数
 func handleCreateConversation(s *store.Store) http.HandlerFunc {
@@ -384,7 +478,7 @@ func handleListMemory(s *store.Store) http.HandlerFunc {
 // M8 触发语义（社交软件式）：
 //   单聊：不解析 @，直接派活给聊天对象（找员工就是为了让他干活）；
 //   群聊：必须 @ 才触发干活，且只能 @ 群成员（支持一条消息 @ 多人）。
-func handleCreateMessage(s *store.Store) http.HandlerFunc {
+func handleCreateMessage(s *store.Store, agentCmd string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		convID := r.PathValue("id") // 路由里的 {id} 参数
 
@@ -494,10 +588,57 @@ func handleCreateMessage(s *store.Store) http.HandlerFunc {
 			return
 		}
 
+		// ⑤ 自动拉起 agent：单聊/群聊 @ 触发任务后，如果本地 agent 没在运行，尝试启动它。
+		// 这里用内存 map 防止同一 server 会话内重复拉起；agent 退出后下次消息会再次拉起。
+		for i := range targets {
+			ensureAgentStarted(targets[i].ID, targets[i].Name, agentCmd)
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		json.NewEncoder(w).Encode(msg)
 	}
+}
+
+// startedAgents 记录本 server 进程内自动拉起的 agent，避免重复启动。
+var startedAgents sync.Map
+
+// ensureAgentStarted 尝试启动一个本地 agent 进程。
+// 启动命令通过 server 的 -agent-cmd 参数配置，默认是 bin/agent.exe（项目根目录下的产物）。
+// 用 agent id 作为去重键：员工改名后不会重复拉起同一个 agent。
+// 如果进程已经由本 server 拉起过，则跳过；如果 agent 退出，下次消息会再次拉起。
+func ensureAgentStarted(id, name, cmd string) {
+	if id == "" || name == "" || cmd == "" {
+		return
+	}
+	if _, ok := startedAgents.Load(id); ok {
+		return
+	}
+
+	// cmd.Dir 指向 server 的工作目录（通常就是项目根），保证 agent 用相对路径
+	// "mini-agents.db" 能打开同一个库。不设的话 agent 继承 server 的 cwd，
+	// 若 server 从别的目录启动，agent 会在错误目录新建空库、找不到员工档案直接退出。
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Printf("⚠️  读取工作目录失败: %v", err)
+		cwd = "."
+	}
+	agentProcess := exec.Command(cmd, "-name", name)
+	agentProcess.Dir = cwd
+	agentProcess.Stdout = log.Writer()
+	agentProcess.Stderr = log.Writer()
+	if err := agentProcess.Start(); err != nil {
+		log.Printf("⚠️  自动拉起 agent %s 失败: %v", name, err)
+		return
+	}
+	startedAgents.Store(id, true)
+	log.Printf("🚀 已自动拉起 agent %s (id=%s pid=%d)", name, id, agentProcess.Process.Pid)
+
+	go func() {
+		_ = agentProcess.Wait()
+		startedAgents.Delete(id)
+		log.Printf("🛑 agent %s 进程已退出", name)
+	}()
 }
 
 // handleListMessages 返回一个"取消息流"的处理函数（前端 2 秒轮询用）。

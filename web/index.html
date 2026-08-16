@@ -9,16 +9,16 @@
        把颜色/字体集中定义成变量，全界面引用——改一处全变。
        灵感来自"夜间调度台"：深蓝黑工作台 + 设备红绿灯。 */
     :root {
-      --bg: #0D1117;      /* 工作台底色：深蓝黑 */
-      --panel: #151B23;   /* 侧栏 / 面板 */
-      --panel2: #1B2430;  /* 输入条 / 悬停 */
-      --line: #232B37;    /* 分隔线 */
-      --text: #EAE6DF;    /* 主文字：暖白 */
-      --muted: #87919F;   /* 次要文字 */
-      --amber: #E8A13C;   /* 老板身份：琥珀（你的消息） */
-      --blue: #4FB3FF;    /* 交互 / 选中：亮蓝 */
-      --green: #4FD1A5;   /* 运行中：绿灯 */
-      --red: #FF5D5D;     /* blocked：红灯（呼应 M5 终端红告警） */
+      --bg: #F5F6F8;      /* 工作台底色：浅灰 */
+      --panel: #FFFFFF;   /* 侧栏 / 面板 */
+      --panel2: #EEF1F5;  /* 输入条 / 悬停 */
+      --line: #D8DEE6;    /* 分隔线 */
+      --text: #1F2328;    /* 主文字：深灰 */
+      --muted: #6B7280;   /* 次要文字 */
+      --amber: #B45309;   /* 老板身份：琥珀（你的消息） */
+      --blue: #2563EB;    /* 交互 / 选中：亮蓝 */
+      --green: #059669;   /* 运行中：绿灯 */
+      --red: #DC2626;     /* blocked：红灯 */
       --mono: "Cascadia Mono", Consolas, monospace; /* 等宽：时间戳/状态/agent 消息 */
     }
 
@@ -212,6 +212,34 @@
       cursor: pointer;
     }
     #btn-send:hover { filter: brightness(1.1); }
+      #at-popup {
+        position: fixed;
+        bottom: 70px;
+        left: 280px;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        box-shadow: 0 6px 20px rgba(0,0,0,.12);
+        padding: 6px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 160px;
+        max-height: 200px;
+        overflow-y: auto;
+        z-index: 30;
+      }
+      #at-popup button {
+        text-align: left;
+        padding: 6px 10px;
+        border: none;
+        background: transparent;
+        color: var(--text);
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #at-popup button:hover { background: var(--panel2); }
 
     /* ═══ 8. 收尾：滚动条 + 窄屏 ═══ */
     ::-webkit-scrollbar { width: 8px; }
@@ -266,7 +294,8 @@
       <h1>团队台</h1>
       <div class="head-actions">
         <button id="btn-hire" title="入职新员工">＋人</button>
-        <button id="btn-new" title="新建会话">＋</button>
+        <button id="btn-agents" title="员工管理">员</button>
+          <button id="btn-new" title="新建会话">＋</button>
       </div>
     </header>
     <!-- 会话列表：JS 每 2 秒刷新填充 -->
@@ -280,6 +309,9 @@
 
     <!-- 消息流：滚动的对话记录，JS 填充 -->
     <section id="msg-flow" aria-live="polite"></section>
+    <!-- @ 成员选择器：输入框内输入 @ 时弹出 -->
+    <div id="at-popup" hidden></div>
+
 
     <!-- 底部：输入条（@员工 触发干活） -->
     <footer id="composer">
@@ -338,6 +370,17 @@
         <button type="submit">创建</button>
       </div>
     </form>
+    </dialog>
+
+  <!-- ═══ 员工管理 对话框 ═══ -->
+  <dialog id="dlg-agents">
+    <h3>员工管理</h3>
+    <div id="agent-list" style="display:flex;flex-direction:column;gap:8px;max-height:320px;overflow-y:auto;"></div>
+    <div class="dlg-actions">
+      <button type="button" id="agents-cancel">关闭</button>
+    </div>
+  </dialog>
+
   </dialog>
 
   <script>
@@ -447,27 +490,40 @@
       }).join('');
     }
 
-    /* ═══ 5. 渲染：会话头部（名字 + 类型 + 成员快捷 @ chip）═══ */
+    /* ═══ 5. 渲染：会话头部（名字 + 类型 + 群聊改名按钮）═══ */
     function renderConvHead() {
       const head = document.getElementById('conv-head');
       if (!currentConv) { head.innerHTML = '<h2>选择一个会话</h2>'; return; }
       const c = convs.find(x => x.ID === currentConv);
       if (!c) return;
+      let title = c.Name;
+      if (c.Type === 'direct' && c.Members && c.Members.length > 0) {
+        title = c.Members[0]; // 单聊标题只显示员工名字
+      }
+      const renameBtn = c.Type === 'group'
+        ? '<button id="btn-rename-conv" class="chip" type="button">改名</button>'
+        : '';
       head.innerHTML =
-        '<h2>' + esc(c.Name) + '</h2>' +
-        '<span class="conv-type">' + esc(c.Type) + '</span>' +
-        '<div class="member-chips">' + (c.Members || []).map(name =>
-          '<button class="chip" data-name="' + esc(name) + '">@' + esc(name) + '</button>'
-        ).join('') + '</div>';
-      // 点 chip = 把 @名字 追加到输入框（触发 agent 干活的第一步）
-      head.querySelectorAll('.chip').forEach(b => {
-        b.onclick = () => {
-          const inp = document.getElementById('input');
-          const sep = (inp.value === '' || inp.value.endsWith(' ')) ? '' : ' ';
-          inp.value += sep + '@' + b.dataset.name + ' ';
-          inp.focus();
+        '<h2>' + esc(title) + '</h2>' +
+        '<span class="conv-type">' + esc(c.Type) + '</span>' + renameBtn;
+      // 改名按钮：只有群聊才有（单聊标题是员工名，没有改名的意义）
+      const rename = document.getElementById('btn-rename-conv');
+      if (rename) {
+        rename.onclick = async () => {
+          const newName = prompt('输入新的群聊名称', c.Name);
+          if (!newName) return;
+          try {
+            const res = await fetch('/api/conversations/' + c.ID, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: newName }),
+            });
+            if (!res.ok) { alert(await res.text()); return; }
+            await loadConvs();
+            renderConvs();
+          } catch (err) { alert('改名失败: ' + err); }
         };
-      });
+      }
     }
 
     /* ═══ 6. 渲染：消息流（工作记录流）═══ */
@@ -506,9 +562,9 @@
     async function sendMessage() {
       const inp = document.getElementById('input');
       const content = inp.value.trim();
-        const btn = document.getElementById('btn-send');
-        if (!content || !currentConv) return; // 空消息 / 没选会话 → 不发
-        btn.disabled = true; // 防止快速连按重复发送
+      const btn = document.getElementById('btn-send');
+      if (!content || !currentConv) return; // 空消息 / 没选会话 → 不发
+      btn.disabled = true; // 防止快速连按重复发送
       try {
         const res = await fetch('/api/conversations/' + currentConv + '/messages', {
           method: 'POST',
@@ -532,6 +588,112 @@
         console.warn('发送后刷新失败', err);
       }
     }
+
+    /* ═══ 8.6 员工管理 ═══ */
+    function renderAgentList() {
+      const box = document.getElementById('agent-list');
+      box.innerHTML = '';
+      for (const a of agents) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px;border:1px solid var(--line);border-radius:6px;';
+        const info = document.createElement('span');
+        info.textContent = a.Name + (a.Role ? '（' + a.Role + '）' : '') + ' [' + a.Engine + ']';
+        const actions = document.createElement('span');
+        actions.style.cssText = 'display:flex;gap:6px;';
+        const btnRename = document.createElement('button');
+        btnRename.type = 'button';
+        btnRename.textContent = '改名';
+        btnRename.onclick = async () => {
+          const newName = prompt('输入新的员工名字', a.Name);
+          if (!newName) return;
+          try {
+            const res = await fetch('/api/agents/' + a.ID, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: newName, role: a.Role, description: a.Description }),
+            });
+            if (!res.ok) { alert(await res.text()); return; }
+            await Promise.all([loadAgents(), loadTeam(), loadConvs()]);
+            renderAgentList();
+            renderConvs();
+          } catch (err) { alert('改名失败: ' + err); }
+        };
+        const btnDelete = document.createElement('button');
+        btnDelete.type = 'button';
+        btnDelete.textContent = '删除';
+        btnDelete.style.color = 'var(--red)';
+        btnDelete.onclick = async () => {
+          if (!confirm('确定删除员工 ' + a.Name + '？历史消息/任务会保留但失去姓名关联。')) return;
+          try {
+            const res = await fetch('/api/agents/' + a.ID, { method: 'DELETE' });
+            if (!res.ok) { alert(await res.text()); return; }
+            await Promise.all([loadAgents(), loadTeam(), loadConvs()]);
+            renderAgentList();
+            renderConvs();
+          } catch (err) { alert('删除失败: ' + err); }
+        };
+        actions.append(btnRename, btnDelete);
+        row.append(info, actions);
+        box.appendChild(row);
+      }
+    }
+
+    document.getElementById('btn-agents').onclick = async () => {
+      await loadAgents();
+      renderAgentList();
+      document.getElementById('dlg-agents').showModal();
+    };
+    document.getElementById('agents-cancel').onclick = () => document.getElementById('dlg-agents').close();
+
+    /* ═══ 8.7 输入框手动 @ 成员选择 ═══ */
+    function currentConvMembers() {
+      const c = convs.find(x => x.ID === currentConv);
+      return c && c.Members ? c.Members : [];
+    }
+
+    function renderAtPopup() {
+      const popup = document.getElementById('at-popup');
+      const members = currentConvMembers();
+      if (!members.length) { popup.hidden = true; return; }
+      popup.innerHTML = '';
+      for (const name of members) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = '@' + name;
+        btn.onclick = () => {
+          const inp = document.getElementById('input');
+          const parts = inp.value.split('@');
+          const last = parts.pop() || '';
+          // \u53ea\u66ff\u6362\u6389"\u6700\u540e\u4e00\u4e2a @ \u4e4b\u540e\u3001\u5339\u914d\u4e0a\u6210\u5458\u540d\u7684\u524d\u7f00"\uff0c\u5269\u4f59\u6587\u5b57\u4fdd\u7559\u3002
+          // \u8001\u5199\u6cd5\u7528\u6b63\u5219\u628a @ \u540e\u7684\u4e2d\u6587\u82f1\u6587\u6570\u5b57\u5168\u541e\u6389\uff0c\u4f1a\u628a @\u5c0f\u738b\u4f60\u597d \u91cc\u7684"\u4f60\u597d"\u4e5f\u5220\u4e86\u3002
+          // \u53d6"\u6700\u957f\u5339\u914d\u6210\u5458\u540d"\uff1a\u5982\u679c\u6210\u5458\u91cc\u6709 \u5c0f\u738b\u3001\u5c0f\u738b\u4e8c\uff0c\u8f93\u5165 @\u5c0f\u738b\u4e8c\u597d \u5e94\u4fdd\u7559"\u597d"\u3002
+          let matched = '';
+          for (const m of members) {
+            if (last.startsWith(m) && m.length > matched.length) matched = m;
+          }
+          const tail = matched ? last.slice(matched.length) : '';
+          parts.push(name + ' ' + tail);
+          inp.value = parts.join('@');
+          inp.focus();
+          popup.hidden = true;
+        };
+        popup.appendChild(btn);
+      }
+      popup.hidden = false;
+    }
+
+    document.getElementById('input').addEventListener('input', () => {
+      const value = document.getElementById('input').value;
+      const atIndex = value.lastIndexOf('@');
+      if (atIndex >= 0 && !value.slice(atIndex + 1).includes(' ')) {
+        renderAtPopup();
+      } else {
+        document.getElementById('at-popup').hidden = true;
+      }
+    });
+    document.getElementById('input').addEventListener('blur', () => {
+      setTimeout(() => { document.getElementById('at-popup').hidden = true; }, 150);
+    });
 
     /* ═══ 8. 事件绑定 + 轮询启动 ═══ */
     document.getElementById('btn-send').onclick = sendMessage;
