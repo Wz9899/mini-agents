@@ -279,11 +279,11 @@
     <header id="conv-head"></header>
 
     <!-- 消息流：滚动的对话记录，JS 填充 -->
-    <section id="msg-flow"></section>
+    <section id="msg-flow" aria-live="polite"></section>
 
     <!-- 底部：输入条（@员工 触发干活） -->
     <footer id="composer">
-      <textarea id="input" rows="1" placeholder="消息里 @员工 触发干活 · Enter 发送"></textarea>
+      <textarea id="input" rows="1" aria-label="消息输入" placeholder="消息里 @员工 触发干活 · Enter 发送"></textarea>
       <button id="btn-send">发送</button>
     </footer>
   </main>
@@ -367,32 +367,39 @@
     /* ═══ 3. 拉三个接口 ═══ */
     async function loadConvs() {
       convs = await getJSON('/api/conversations');
-      renderConvs();
     }
     async function loadTeam() {
       team = await getJSON('/api/team');
-      renderConvs(); // 状态灯变了 → 列表重画（顺带刷新头部）
+      /* 状态灯变了 → 由调用方统一刷新 */
     }
     async function loadMessages() {
       if (!currentConv) { lastMsg = null; renderMessages([]); return; } // 没选会话就显示空
+      // 增量拉取：后端用 ULID 游标（id > afterID），避免 created_at 单调时钟问题。
+      
+      
       let url = '/api/conversations/' + currentConv + '/messages';
-      if (lastMsg) url += '?after=' + encodeURIComponent(lastMsg.ID); // 增量拉取
-      const msgs = await getJSON(url);
+        if (lastMsg) url += '?after=' + encodeURIComponent(lastMsg.ID); // 增量拉取
+        const msgs = await getJSON(url);
       if (lastMsg) {
-        // 增量：只把新消息追加到消息流末尾
-        if (msgs.length > 0) {
-          renderMessages(msgs, true);
-          lastMsg = msgs[msgs.length - 1];
+          // 增量：只把新消息追加到消息流末尾
+          if (msgs.length > 0) {
+            // 后端已改用 ULID 游标，若仍出现游标失效回退全量，这里识别并重建
+            if (new Date(msgs[0].CreatedAt) <= new Date(lastMsg.CreatedAt)) {
+              renderMessages(msgs);
+            } else {
+              renderMessages(msgs, true);
+            }
+            lastMsg = msgs[msgs.length - 1];
+          }
+        } else {
+          // 全量：重建消息流并记住游标
+          renderMessages(msgs);
+          if (msgs.length > 0) lastMsg = msgs[msgs.length - 1];
         }
-      } else {
-        // 全量：重建消息流并记住游标
-        renderMessages(msgs);
-        if (msgs.length > 0) lastMsg = msgs[msgs.length - 1];
-      }
     }
     async function loadAgents() {
       agents = await getJSON('/api/agents');
-      renderMemberList(); // 员工列表变了 → 重画"新建会话"的成员勾选
+      // 员工列表在打开“新建会话”弹窗时再渲染，避免每 2 秒重建隐藏 DOM
     }
     // renderMemberList：把每个员工画成一个勾选框。role 空 = 无预设职责，显示"通用"
     function renderMemberList() {
@@ -435,7 +442,8 @@
         const st = team.find(t => t.Name === name); // 在团队状态里找这位
         const cls = st && st.Status === 'running' ? 'running'
                  : st && st.Status === 'blocked' ? 'blocked' : '';
-        return '<span class="dot ' + cls + '" title="' + esc(name) + '"></span>';
+          const statusText = st && st.Status ? st.Status : 'idle';
+        return '<span class="dot ' + cls + '" role="img" title="' + esc(name) + '" aria-label="' + esc(name) + ' ' + statusText + '"></span>';
       }).join('');
     }
 
@@ -498,15 +506,31 @@
     async function sendMessage() {
       const inp = document.getElementById('input');
       const content = inp.value.trim();
-      if (!content || !currentConv) return; // 空消息 / 没选会话 → 不发
-      await fetch('/api/conversations/' + currentConv + '/messages', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content }) // 原样发送：@成员 由 server 解析触发干活
-      });
-      inp.value = '';      // 清空输入框
-      loadMessages();      // 立刻刷新（不用等 2 秒轮询）
-      loadConvs();         // 可能新任务入队，会话/状态刷新
+        const btn = document.getElementById('btn-send');
+        if (!content || !currentConv) return; // 空消息 / 没选会话 → 不发
+        btn.disabled = true; // 防止快速连按重复发送
+      try {
+        const res = await fetch('/api/conversations/' + currentConv + '/messages', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content }) // 原样发送：@成员 由 server 解析触发干活
+        });
+        if (!res.ok) { alert(await res.text()); return; } // 失败不清空输入框
+        inp.value = '';      // 成功后清空输入框
+      } catch (err) {
+        alert('发送失败: ' + err);
+        return;
+      } finally {
+        btn.disabled = false;
+      }
+
+      // 刷新动作与发送动作分开：即使刷新失败，也不能误报“发送失败”
+      try {
+        await Promise.all([loadMessages(), loadConvs(), loadTeam()]);
+        renderConvs();
+      } catch (err) {
+        console.warn('发送后刷新失败', err);
+      }
     }
 
     /* ═══ 8. 事件绑定 + 轮询启动 ═══ */
@@ -543,8 +567,9 @@
         });
         if (!res.ok) { alert(await res.text()); return; } // 后端报错（如重名）原样弹给用户
         document.getElementById('dlg-hire').close();
-        loadTeam();
-        loadAgents();
+        await Promise.all([loadTeam(), loadAgents()]);
+        renderConvs(); // 刷新团队状态
+          renderMemberList(); // 刷新“新建会话”成员勾选
       } catch (err) { alert('入职失败: ' + err); }
     };
 
@@ -565,19 +590,23 @@
         });
         if (!res.ok) { alert(await res.text()); return; }
         document.getElementById('dlg-new').close();
-        loadConvs();
+        await loadConvs();
+          renderConvs();
       } catch (err) { alert('创建会话失败: ' + err); }
     };
 
     // 立即刷一次（首屏），然后每 2 秒轮询。
-    // Promise.all 三个并行；任一失败只警告不打断——server 没起时页面不至于白屏死循环。
+    // Promise.allSettled 并行拉取；单个接口失败不阻止其他数据渲染。
     async function tick() {
-      try {
-        await Promise.all([loadConvs(), loadTeam(), loadMessages(), loadAgents()]);
-      } catch (err) { console.warn('轮询失败（server 没起？）', err); }
+        await Promise.allSettled([loadConvs(), loadTeam(), loadMessages(), loadAgents()]);
+        renderConvs(); // 数据都更新后统一渲染一次，避免多次清空重建
+      
     }
-    tick();
-    setInterval(tick, 2000); // 2 秒轮询：纯本地读，零 token 消耗
+    tickLoop();
+    async function tickLoop() {
+        await tick();
+        setTimeout(tickLoop, 2000); // 链式 setTimeout：避免上一次未完成时下一次又启动
+      }
   </script>
 </body>
 </html>

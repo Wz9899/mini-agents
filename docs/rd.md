@@ -545,13 +545,18 @@ git rm --cached *.db *.db-shm *.db-wal *.log 2>/dev/null
 
 ### P1-4：补测试
 
-**目标**：
+**已实施**：
 
-1. `cmd/server` 的 handler 迁到 `internal/api`，用 `net/http/httptest` 测试。
-2. `internal/agent` 增加引擎测试：
-   - `ClaudeEngine{Command: 假脚本路径}` 验证输出、退出码、超时。
-   - `PiEngine` 用假 RPC 进程输出 JSONL，验证 `text_delta` 拼接。
-3. `cmd/agent` 的 prompt 拼装与 `reportFailure` 分支可抽成函数测试。
+1. `cmd/server/main_test.go`：使用 `httptest` 覆盖创建任务、员工入职、消息触发任务三个 HTTP handler。
+2. `internal/agent/engine_test.go`：覆盖 `FakeEngine.Execute` 与 `NewEngine` 工厂分支。
+3. `internal/store/store_test.go`：补充 `SendMessageWithTasks` 事务关联测试。
+
+**仍可继续增强**：
+
+- 将 handler 从 `cmd/server` 迁到 `internal/api`，进一步降低耦合。
+- `ClaudeEngine` 用假脚本路径验证输出、退出码、超时。
+- `PiEngine` 用假 RPC 进程输出 JSONL，验证 `text_delta` 拼接。
+- `cmd/agent` 的 prompt 拼装与 `reportFailure` 分支抽成函数测试。
 
 **验证**：`go test ./...` 覆盖 handler、engine、store。
 
@@ -651,7 +656,9 @@ for i := range all {
 **方案（已实施）**：
 
 1. 后端新增 `ListMessagesAfter(ctx, conversationID, afterID)`，`GET /api/conversations/{id}/messages?after=<消息ID>` 只返回游标之后的新消息。
-2. 前端记录 `lastMsg`，轮询时带 `?after=<lastMsg.ID>`，将新消息 `append` 到消息流而不是清空重绘；切换会话时重置游标并全量加载。
+2. 游标使用消息 ULID `id > ?` 判断，避免 SQLite 中 `created_at` 因 Go 单调时钟后缀导致游标消息重复返回。
+3. 前端记录 `lastMsg`，轮询时带 `?after=<lastMsg.ID>`，将新消息 `append` 到消息流而不是清空重绘；切换会话时重置游标并全量加载。
+4. 若后端因游标失效退回全量，前端通过“首条消息时间 <= 游标时间”识别并改为全量重建，避免重复消息。
 
 **验证**：造 100 条消息，滚动和刷新无明显抖动。
 

@@ -120,6 +120,11 @@
 - **旧库自动迁移**（RD P0-5）：`CREATE TABLE IF NOT EXISTS` 不会给旧表补新列。新增列时用 `PRAGMA table_info` 检查 + `ALTER TABLE` 补列，让旧 DB 打开时自动升级
 - **@ 解析边界匹配**（RD P2-4）：`strings.Contains` 会把"@小王总"误判给"小王"。先按名字长度降序匹配长名，再检查 `@name` 后一个字符必须是空白/标点/结尾
 - **空闲日志降噪**（RD P2-1）：每 2 秒一条"没有派给我的活"会刷爆日志。用状态变化触发打印（只在从有活到没活时打一次），既安静又能发现问题
+- **前端发送错误处理**（前端审核 P0）：发消息前先检查 `res.ok`，失败时 `alert` 并保留输入框内容；发送期间禁用按钮，防止连按重复提交
+- **前端链式轮询**（前端审核 P1）：`setInterval` 可能在上一次请求未结束时再次触发；改用 `setTimeout` 链式调用，等上一轮完成后再等 2 秒
+- **前端统一渲染**（前端审核 P1）：`loadConvs` / `loadTeam` 只更新数据，由 `tick` 或提交成功后统一调用一次 `renderConvs()`，避免一次轮询里多次清空重建 DOM
+- **前端无障碍**（前端审核 P2）：消息流加 `aria-live="polite"`，输入框加 `aria-label`，状态灯加 `role="img"` + `aria-label`，让屏幕阅读器能感知新消息和员工状态
+- **time.Time.String() 存储格式坑**（V2 RD 验证真 bug）：SQLite 存 Go time.Time 时驱动按 `time.Time.String()` 落盘，带 `m=+XX.XXXX` 单调时钟后缀。单调时钟是进程私有读数，**扫描读回时必然丢失**（从字符串恢复不了）；再把读回的时间当查询参数绑回去，格式就与库值不一致（库值多了 ` m=...` 后缀）→ 字符串比较 `created_at > ?` 把"库值比前缀相同的参数长"当成 `>`，**游标消息自己也被返回** → 增量拉取重复返回。为什么孤儿回收没踩坑？它用 `time.Now().Add()` 直接生成 cutoff（进程内带 m=，与库值格式一致）；坑只出现在"扫描恢复"的时间戳上。**当前修复**：增量拉取不再用 `created_at` 做游标，改用消息 ULID `id > ?` 判断，ULID 本身按时间有序，从根上绕开单调时钟问题；前端恢复 `?after=` 增量拉取。后续仍建议统一时间格式常量（如 `2006-01-02 15:04:05.999999999 -07:00`），避免其他地方再次踩坑
 
 ## 文件清单（当前）
 
@@ -130,7 +135,8 @@ mini-agents/
   docs/rd.md                  ✅ 优化 RD 文档（P0-P2 清单与方案）
   internal/store/schema.sql   ✅ 8 张表 + 业务索引 + task_queue.dispatched_at
   internal/store/store.go     ✅ 数据层（事务化 CreateIssue/SendMessageWithTasks；issues.status 同步；RequeueStaleTasks 孤儿回收）
-  internal/store/store_test.go ✅ 任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收测试
+  internal/store/store_test.go ✅ 任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收/消息事务测试
+    cmd/server/main_test.go     ✅ HTTP handler 测试（创建任务/员工/消息触发任务）
   cmd/server/main.go          ✅ HTTP 服务（默认 127.0.0.1:8080；issues/agents/conversations/messages/team 路由 + 静态文件）
   cmd/agent/main.go           ✅ Agent 入口（-name 认领自己的任务；孤儿回收；失败重试/上报/级联；空闲日志降噪）
   cmd/dump/main.go            ✅ 查看任务+队列+执行日志的小工具（调试用）
@@ -139,6 +145,7 @@ mini-agents/
   internal/agent/deepseek.go  ✅ DeepSeekEngine 预留 stub（dsh 待接入）
   internal/agent/fake.go      ✅ FakeEngine（干跑用，不调 LLM 省 token）
   internal/agent/engine.go    ✅ NewEngine 工厂（按名字选实现，多态入口）
-  web/index.html              ✅ M6 飞书式前端「夜间调度台」（会话列表+消息记录流+输入框+@chip+2 秒轮询+状态灯；M8-1 加入职/新建会话面板）
+    internal/agent/engine_test.go ✅ 引擎测试（FakeEngine + NewEngine 工厂）
+  web/index.html              ✅ M6 飞书式前端「夜间调度台」（会话列表+消息流+@chip+链式轮询+增量拉取+状态灯+无障碍；M8-1 加入职/新建会话面板）
   internal/memory/            ⬜ M7 双层知识库（memory 表 + 文档/代码归档 + 注入）
 ```

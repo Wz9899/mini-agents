@@ -15,6 +15,7 @@ mini-agents/
 │
 ├── cmd/                        「可执行程序」入口目录
 │   ├── server/main.go 约400行   HTTP 服务：路由 + handler + JSON + 静态文件
+│   ├── server/main_test.go 约90行 HTTP handler 测试
 │   ├── agent/main.go  约283行   agent 进程：认领→读任务→调引擎→记账→汇报（含孤儿回收）
 │   └── dump/main.go   88行      调试工具：打印任务/队列/执行日志
 │
@@ -22,16 +23,17 @@ mini-agents/
 │   ├── store/                  数据层（只管数据，不碰 HTTP）
 │   │   ├── schema.sql  约90行   8 张表建表语句（幂等）+ 业务索引
 │   │   ├── store.go   约1160行  数据操作 + 事务 + 状态同步 + 孤儿回收 + 增量消息
-│   │   └── store_test.go 约530行 测试：任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收
+│   │   └── store_test.go 约590行 测试：任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收/消息事务
 │   └── agent/                  Agent 执行器
 │       ├── runner.go 79行       ClaudeEngine：封装 claude -p 调用
 │       ├── pi.go     91行       PiEngine：pi --mode rpc JSONL 流式执行
 │       ├── deepseek.go 22行     DeepSeekEngine：预留 stub
 │       ├── fake.go   24行       FakeEngine：干跑测试用
-│       └── engine.go 18行       NewEngine 工厂（按名字选实现）
+│       ├── engine.go 18行       NewEngine 工厂（按名字选实现）
+│       └── engine_test.go 约40行 引擎测试（FakeEngine + NewEngine 工厂）
 │
 └── web/                        前端目录（M6 飞书式「夜间调度台」）
-    └── index.html 约584行       会话列表 + 消息流 + 2 秒轮询 + 增量拉取
+    └── index.html 约613行       会话列表 + 消息流 + 链式轮询 + 增量拉取 + 无障碍
 ```
 
 ## 二、分层架构（三层，单向依赖）

@@ -377,6 +377,49 @@ func TestTeamStatusAndConversations(t *testing.T) {
 	t.Logf("✅ 会话带成员 + 团队状态聚合通过")
 }
 
+// TestSendMessageWithTasks 验证发消息 + 任务关联在同一个事务里完成。
+func TestSendMessageWithTasks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	agent, err := s.CreateAgent(ctx, "小王", "前端工程师", "负责页面", "fake")
+	if err != nil {
+		t.Fatalf("CreateAgent 失败: %v", err)
+	}
+	conv, err := s.CreateConversation(ctx, "和小王的私聊", "direct", []string{agent.ID})
+	if err != nil {
+		t.Fatalf("CreateConversation 失败: %v", err)
+	}
+	issue, err := s.CreateIssue(ctx, "消息触发的任务", "", agent.ID, "")
+	if err != nil {
+		t.Fatalf("CreateIssue 失败: %v", err)
+	}
+
+	msg, err := s.SendMessageWithTasks(ctx, conv.ID, "user", "me", "@小王 帮我干活", []string{issue.ID})
+	if err != nil {
+		t.Fatalf("SendMessageWithTasks 失败: %v", err)
+	}
+	if msg.ID == "" {
+		t.Fatal("消息 id 不应为空")
+	}
+
+	src, err := s.GetMessageByTask(ctx, issue.ID)
+	if err != nil {
+		t.Fatalf("GetMessageByTask 失败: %v", err)
+	}
+	if src == nil || src.ID != msg.ID {
+		t.Fatalf("任务应能反查来源消息，实际 src=%+v", src)
+	}
+
+	t.Logf("✅ SendMessageWithTasks 通过：消息与任务关联可反查")
+}
+
+
 // TestIssueStatusSync 验证 issues.status 会随流水线同步：
 // 创建 todo → 开工 in_progress → 完成 done。
 func TestIssueStatusSync(t *testing.T) {

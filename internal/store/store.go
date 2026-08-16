@@ -463,10 +463,10 @@ func (s *Store) ListMessagesAfter(ctx context.Context, conversationID, afterID s
 		return s.ListMessages(ctx, conversationID)
 	}
 
-	var afterTime time.Time
+	var exists int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT created_at FROM messages WHERE id = ?`, afterID,
-	).Scan(&afterTime)
+		`SELECT 1 FROM messages WHERE id = ?`, afterID,
+	).Scan(&exists)
 	if err == sql.ErrNoRows {
 		// afterID 不存在（比如会话被重置），退回全量拉取，前端会重建消息流。
 		return s.ListMessages(ctx, conversationID)
@@ -475,13 +475,14 @@ func (s *Store) ListMessagesAfter(ctx context.Context, conversationID, afterID s
 		return nil, fmt.Errorf("查询增量游标失败: %w", err)
 	}
 
+	// 用 ULID 字符串做游标，避免 created_at 的单调时钟（m=+...）在 SQLite 里
+	// 往返后比较不一致的问题。ULID 本身按时间有序，id > ? 即可拿到游标之后的新消息。
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, conversation_id, sender_type, sender_id, content, task_id, created_at
 		 FROM messages
-		 WHERE conversation_id = ?
-		   AND (created_at > ? OR (created_at = ? AND id > ?))
+		 WHERE conversation_id = ? AND id > ?
 		 ORDER BY created_at, id`,
-		conversationID, afterTime, afterTime, afterID,
+		conversationID, afterID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("查询增量消息失败: %w", err)

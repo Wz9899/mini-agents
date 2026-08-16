@@ -24,6 +24,20 @@ func main() {
 	defer s.Close()
 
 	// 2. 创建路由表，登记"哪个 URL 由哪个函数处理"
+	mux := newMux(s)
+
+	// 3. 启动 HTTP 服务
+	log.Printf("服务已启动: http://%s", *addr)
+	if err := http.ListenAndServe(*addr, mux); err != nil {
+		log.Fatalf("服务启动失败: %v", err)
+	}
+}
+
+// newMux 构建路由表：登记"哪个 URL 由哪个函数处理"。
+// 为什么要抽成函数？main 和测试共用同一张路由表。
+// 测试用 httptest + mux.ServeHTTP 走真实路由，连 {id} 路径参数的解析
+// （r.PathValue）也会被一起验证——直接调 handler 函数拿不到路径参数。
+func newMux(s *store.Store) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/issues", handleCreateIssue(s))
 	mux.HandleFunc("GET /api/issues", handleListIssues(s))
@@ -39,12 +53,7 @@ func main() {
 	// 为什么用 "GET /"？它是兜底路由——ServeMux 永远选"最长匹配"，
 	// 所以 /api/... 走上面注册的精确路由，剩下的（如 / 和 /index.html）才落进这里。
 	mux.Handle("GET /", http.FileServer(http.Dir("web")))
-
-	// 3. 启动 HTTP 服务
-	log.Printf("服务已启动: http://%s", *addr)
-	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatalf("服务启动失败: %v", err)
-	}
+	return mux
 }
 
 // handleCreateIssue 返回一个"创建任务"的处理函数
