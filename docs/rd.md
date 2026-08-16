@@ -726,6 +726,8 @@ go vet ./...
 ## 8. 后续演进（不在本次范围）
 
 - M7 双层知识库：`memory` 表 + `scope` 隔离 + 执行时注入。
+- M7 记忆注入预算控制（当前是"作用域过滤后的全量注入"）：后续加**条数上限 + 最大字符截断**（如 L1 ≤ 5 条、`maxTotalRecallChars`），并按任务内容做**相关性召回**（关键词 FTS / 向量检索，只注入相关条目）——参考 TencentDB-Agent-Memory 的 Recall Budget 与混合检索。
+- M7 注入分块优化：区分**动态上下文**（每轮变化的记忆，前插到用户消息前）与**稳定上下文**（画像/规范等长期内容，追加到 system 末尾），利用 Prompt Caching 缓存稳定块省 token——参考 TencentDB 的 RecallResult 分块设计。
 - 轮询升级 SSE/WebSocket：参考 Multica 推送模型。
 - `agents.engine` 抽象为独立 `agent_runtime` 表，支持多 agent 共享运行时与云端执行。
 - 消息增量拉取完成后，可增加已读游标与未读计数。
