@@ -34,7 +34,44 @@ func Open(path string) (*Store, error) {
 		db.Close() // 建表失败：刚开的连接不能泄漏，关掉再返回错误
 		return nil, fmt.Errorf("建表失败: %w", err)
 	}
+
+	// 旧库迁移：task_queue 新增的 dispatched_at 列不会由 CREATE TABLE IF NOT EXISTS 补上。
+	// 这里检查列是否存在，不存在则 ALTER TABLE 补列。
+	if err := ensureColumn(db, "task_queue", "dispatched_at", "TIMESTAMP"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移 task_queue.dispatched_at 失败: %w", err)
+	}
+
 	return &Store{db: db}, nil
+}
+
+// ensureColumn 检查表里是否已有某列，没有就 ALTER TABLE 补一列。
+// table/column/ddl 都来自代码硬编码，不拼用户输入，无 SQL 注入风险。
+func ensureColumn(db *sql.DB, table, column, ddl string) error {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil // 列已存在
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	_, err = db.Exec("ALTER TABLE " + table + " ADD COLUMN " + column + " " + ddl)
+	return err
 }
 
 // Close 关闭数据库连接，释放文件占用
@@ -331,6 +368,52 @@ func (s *Store) SendMessage(ctx context.Context, conversationID, senderType, sen
 	return m, nil
 }
 
+// SendMessageWithTasks 往会话里发一条消息，并把一组任务关联到这条消息。
+// 与 SendMessage + AttachTasks 两步分开写不同，这里用事务保证"消息 + 任务关联"原子：
+// 要么都成，要么都回滚——避免 agent 完成后反查不到来源消息。
+func (s *Store) SendMessageWithTasks(ctx context.Context, conversationID, senderType, senderID, content string, taskIDs []string) (*Message, error) {
+	m := &Message{
+		ID:             NewID(),
+		ConversationID: conversationID,
+		SenderType:     senderType,
+		SenderID:       senderID,
+		Content:        content,
+		CreatedAt:      time.Now(),
+	}
+	if len(taskIDs) > 0 {
+		m.TaskID = taskIDs[0] // 兼容旧逻辑：messages.task_id 存第一个主任务
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO messages (id, conversation_id, sender_type, sender_id, content, task_id, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.ConversationID, m.SenderType, m.SenderID, m.Content, m.TaskID, m.CreatedAt,
+	); err != nil {
+		return nil, fmt.Errorf("发送消息失败: %w", err)
+	}
+
+	for _, taskID := range taskIDs {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT OR IGNORE INTO message_tasks (message_id, task_id) VALUES (?, ?)`,
+			m.ID, taskID,
+		); err != nil {
+			return nil, fmt.Errorf("关联任务失败: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交事务失败: %w", err)
+	}
+	return m, nil
+}
+
+
 // AttachTasks 把一组任务关联到一条消息（写 message_tasks 关联表）。
 // 场景：一条消息 @ 多人 → 触发多个任务，每个任务都要能反查到这条消息。
 // OR IGNORE：组合主键已存在就跳过（重复挂同一个任务不报错），幂等。
@@ -372,6 +455,57 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Mess
 	}
 	return msgs, nil
 }
+
+// ListMessagesAfter 取一个会话中在 afterID 之后的新消息（增量拉取用）。
+// 没有 afterID 时退化为全量 ListMessages。
+func (s *Store) ListMessagesAfter(ctx context.Context, conversationID, afterID string) ([]Message, error) {
+	if afterID == "" {
+		return s.ListMessages(ctx, conversationID)
+	}
+
+	var afterTime time.Time
+	err := s.db.QueryRowContext(ctx,
+		`SELECT created_at FROM messages WHERE id = ?`, afterID,
+	).Scan(&afterTime)
+	if err == sql.ErrNoRows {
+		// afterID 不存在（比如会话被重置），退回全量拉取，前端会重建消息流。
+		return s.ListMessages(ctx, conversationID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("查询增量游标失败: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, conversation_id, sender_type, sender_id, content, task_id, created_at
+		 FROM messages
+		 WHERE conversation_id = ?
+		   AND (created_at > ? OR (created_at = ? AND id > ?))
+		 ORDER BY created_at, id`,
+		conversationID, afterTime, afterTime, afterID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询增量消息失败: %w", err)
+	}
+	defer rows.Close()
+
+	msgs := []Message{}
+	for rows.Next() {
+		var m Message
+		var taskID sql.NullString
+		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderType, &m.SenderID, &m.Content, &taskID, &m.CreatedAt); err != nil {
+			return nil, fmt.Errorf("读取增量消息失败: %w", err)
+		}
+		if taskID.Valid {
+			m.TaskID = taskID.String
+		}
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历增量消息失败: %w", err)
+	}
+	return msgs, nil
+}
+
 
 // GetConversationContext 取"某任务来源会话"的最近 limit 条消息，给 agent 当干活背景。
 // 链路：任务 id → message_tasks 反查触发消息 → 拿到会话 id → 取该会话最近 limit 条。
@@ -458,7 +592,15 @@ func (s *Store) CreateIssue(ctx context.Context, title, description, assigneeID,
 		dependsOnArg = dependsOn
 	}
 
-	_, err := s.db.ExecContext(ctx,
+	// 事务：任务 + 入队必须原子完成。
+	// 否则会出现"任务写进 issues，但 task_queue 没写进去"的半截状态——worker 永远领不到。
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO issues (id, title, description, status, assignee_type, assignee_id, depends_on, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		issue.ID, issue.Title, issue.Description, issue.Status, issue.AssigneeType, issue.AssigneeID, dependsOnArg, issue.CreatedAt, issue.UpdatedAt,
@@ -468,8 +610,16 @@ func (s *Store) CreateIssue(ctx context.Context, title, description, assigneeID,
 	}
 
 	// 任务建好，自动入队：让 worker 能领到这份活
-	if err := s.EnqueueTask(ctx, issue.ID); err != nil {
-		return nil, err
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO task_queue (id, issue_id, status, dedup_sha)
+		 VALUES (?, ?, 'queued', ?)`,
+		NewID(), issue.ID, issue.ID,
+	); err != nil {
+		return nil, fmt.Errorf("任务入队失败: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交事务失败: %w", err)
 	}
 	return issue, nil
 }
@@ -528,13 +678,14 @@ func (s *Store) ClaimTask(ctx context.Context, workerID, assigneeID string) (*Qu
 		return nil, fmt.Errorf("查找待认领任务失败: %w", err)
 	}
 
-	// 第二步：抢——乐观锁，把"抢 + 贴标签"合并成一条 SQL
+	// 第二步：抢——乐观锁，把"抢 + 贴标签"合并成一条 SQL。
+	// 同时写 dispatched_at：认领时间，孤儿回收用（进程在认领后、开工前被杀也能被发现）。
 	claimToken := NewID() // 本次认领的凭证，完成/失败时要用它对账
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE task_queue
-		 SET status = 'dispatched', claim_token = ?, worker_id = ?
+		 SET status = 'dispatched', claim_token = ?, worker_id = ?, dispatched_at = ?
 		 WHERE id = ? AND status = 'queued'`,
-		claimToken, workerID, id,
+		claimToken, workerID, time.Now(), id,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("认领任务失败: %w", err)
@@ -553,8 +704,15 @@ func (s *Store) ClaimTask(ctx context.Context, workerID, assigneeID string) (*Qu
 
 // CompleteTask 凭认领凭证，把任务标记为已完成。
 // 凭证不匹配（或任务已被处理）时返回错误——这就是"幂等"：重复调用不会重复搞坏状态。
+// 同时把 issues.status 同步成 done（业务视图与流水线状态一致）。
 func (s *Store) CompleteTask(ctx context.Context, task *QueuedTask) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE task_queue
 		 SET status = 'completed', finished_at = ?
 		 WHERE id = ? AND claim_token = ? AND status IN ('dispatched', 'running')`,
@@ -570,7 +728,15 @@ func (s *Store) CompleteTask(ctx context.Context, task *QueuedTask) error {
 	if affected == 0 {
 		return fmt.Errorf("完成失败: 凭证不匹配或任务已被处理 (id=%s)", task.ID)
 	}
-	return nil
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE issues SET status = 'done', updated_at = ? WHERE id = ?`,
+		time.Now(), task.IssueID,
+	); err != nil {
+		return fmt.Errorf("同步任务状态失败: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // FailTask 凭认领凭证标记任务失败，并自动处理"重试 or 上报"。
@@ -588,12 +754,19 @@ func (s *Store) CompleteTask(ctx context.Context, task *QueuedTask) error {
 // 的判断下沉到 SQL，计数 + 分支在一条 UPDATE 里原子完成——让数据库帮你做决策。
 // 注意：Go 里计算返回状态用的判断和 SQL 里的 CASE 是同一句，改动必须两边同步。
 func (s *Store) FailTask(ctx context.Context, task *QueuedTask, errMsg string) (string, error) {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE task_queue
 		 SET status = CASE WHEN attempts + 1 < ? THEN 'queued' ELSE 'blocked' END,
 		     attempts = attempts + 1,
 		     claim_token = NULL,
 		     worker_id = NULL,
+		     dispatched_at = NULL,
 		     error = ?,
 		     finished_at = ?
 		 WHERE id = ? AND claim_token = ? AND status IN ('dispatched', 'running')`,
@@ -612,8 +785,21 @@ func (s *Store) FailTask(ctx context.Context, task *QueuedTask, errMsg string) (
 
 	// 算返回状态：和 SQL 的 CASE 同一句判断（attempts+1 达到上限 → blocked）
 	finalStatus := "queued"
+	issueStatus := "in_progress" // 回退重试：任务还在处理流程中
 	if task.Attempts+1 >= MaxAttempts {
 		finalStatus = "blocked"
+		issueStatus = "blocked" // 重试耗尽：需要人介入
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE issues SET status = ?, updated_at = ? WHERE id = ?`,
+		issueStatus, time.Now(), task.IssueID,
+	); err != nil {
+		return "", fmt.Errorf("同步任务状态失败: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return "", fmt.Errorf("提交事务失败: %w", err)
 	}
 	return finalStatus, nil
 }
@@ -624,7 +810,13 @@ func (s *Store) FailTask(ctx context.Context, task *QueuedTask, errMsg string) (
 // 直接上报"，比如 claude 明说自己做不到（再重试 = 再烧一次 token 得到同样答案）。
 // reason 是给人类看的说明，存在 error 列里。
 func (s *Store) BlockTask(ctx context.Context, task *QueuedTask, reason string) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE task_queue
 		 SET status = 'blocked', error = ?, finished_at = ?
 		 WHERE id = ? AND claim_token = ? AND status IN ('dispatched', 'running')`,
@@ -640,8 +832,69 @@ func (s *Store) BlockTask(ctx context.Context, task *QueuedTask, reason string) 
 	if affected == 0 {
 		return fmt.Errorf("标记 blocked 失败: 凭证不匹配或任务已被处理 (id=%s)", task.ID)
 	}
-	return nil
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE issues SET status = 'blocked', updated_at = ? WHERE id = ?`,
+		time.Now(), task.IssueID,
+	); err != nil {
+		return fmt.Errorf("同步任务状态失败: %w", err)
+	}
+
+	return tx.Commit()
 }
+
+// RequeueStaleTasks 回收孤儿任务：agent 进程在认领后或开工后被杀，任务会卡在
+// dispatched/running。这里把它们回退到 queued，让其他（或重启后的）agent 可以重新认领。
+// 两类孤儿分别处理：
+//   - running：已开工，用 started_at 判断是否超时。
+//   - dispatched 且 started_at IS NULL：认领后从未开工，用 dispatched_at 判断是否超时。
+//
+// 返回值是本次回退的任务总数。
+func (s *Store) RequeueStaleTasks(ctx context.Context, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-olderThan)
+
+	// 类型 1：已开工但超时未汇报
+	res1, err := s.db.ExecContext(ctx,
+		`UPDATE task_queue
+		 SET status = 'queued',
+		     claim_token = NULL,
+		     worker_id = NULL,
+		     dispatched_at = NULL,
+		     started_at = NULL,
+		     finished_at = NULL,
+		     error = 'worker 超时未汇报，已回退重试'
+		 WHERE status = 'running'
+		   AND started_at IS NOT NULL
+		   AND started_at < ?`,
+		cutoff,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("回收 running 孤儿任务失败: %w", err)
+	}
+
+	// 类型 2：已认领但一直没开工（旧方案只认 started_at，这类任务永远卡死）
+	res2, err := s.db.ExecContext(ctx,
+		`UPDATE task_queue
+		 SET status = 'queued',
+		     claim_token = NULL,
+		     worker_id = NULL,
+		     dispatched_at = NULL,
+		     error = 'worker 认领后未开工，已回退重试'
+		 WHERE status = 'dispatched'
+		   AND started_at IS NULL
+		   AND dispatched_at IS NOT NULL
+		   AND dispatched_at < ?`,
+		cutoff,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("回收 dispatched 孤儿任务失败: %w", err)
+	}
+
+	n1, _ := res1.RowsAffected()
+	n2, _ := res2.RowsAffected()
+	return n1 + n2, nil
+}
+
 
 // CascadeBlock 上游 failed/blocked 时，把依赖它的下游（还在 queued 排队的）级联标成 blocked。
 // 为什么需要：认领有 EXISTS 检查（上游必须 completed 才能领）。上游卡死了，
@@ -653,6 +906,12 @@ func (s *Store) BlockTask(ctx context.Context, task *QueuedTask, reason string) 
 //
 // 返回被级联标成 blocked 的总数。
 func (s *Store) CascadeBlock(ctx context.Context, upstreamIssueID string, reason string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
 	var total int64
 	layer := []string{upstreamIssueID} // 这一层要检查"谁依赖它们"
 	for len(layer) > 0 {
@@ -661,7 +920,7 @@ func (s *Store) CascadeBlock(ctx context.Context, upstreamIssueID string, reason
 			// UPDATE + RETURNING：把"标 blocked"和"拿到被标的任务 id"合进一条 SQL。
 			// RETURNING 是 SQLite 3.35+ 的语法：UPDATE 也能返回被更新行的列。
 			// 不 RETURNING 的话，得先 SELECT 再 UPDATE 两段式，中间可能被别的进程插一刀。
-			rows, err := s.db.QueryContext(ctx,
+			rows, err := tx.QueryContext(ctx,
 				`UPDATE task_queue
 				 SET status = 'blocked', error = ?, finished_at = ?
 				 WHERE status = 'queued'
@@ -686,14 +945,36 @@ func (s *Store) CascadeBlock(ctx context.Context, upstreamIssueID string, reason
 				return total, fmt.Errorf("遍历级联结果失败: %w", err)
 			}
 		}
+
+		// 同步 issues.status：级联 blocked 也是业务状态变更，不能让 API 继续看到 todo。
+		for _, issueID := range next {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE issues SET status = 'blocked', updated_at = ? WHERE id = ?`,
+				time.Now(), issueID,
+			); err != nil {
+				return total, fmt.Errorf("同步级联任务状态失败: %w", err)
+			}
+		}
+
 		layer = next // 继续往下一层找
+	}
+
+	if err := tx.Commit(); err != nil {
+		return total, fmt.Errorf("提交事务失败: %w", err)
 	}
 	return total, nil
 }
 
 // StartTask 标记任务"正式开始执行"：status → running，并记录开始时间。
+// 同时把 issues.status 同步成 in_progress（业务视图不再是 todo）。
 func (s *Store) StartTask(ctx context.Context, task *QueuedTask) error {
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启事务失败: %w", err)
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
 		`UPDATE task_queue
 		 SET status = 'running', started_at = ?
 		 WHERE id = ? AND claim_token = ? AND status = 'dispatched'`,
@@ -709,7 +990,15 @@ func (s *Store) StartTask(ctx context.Context, task *QueuedTask) error {
 	if affected == 0 {
 		return fmt.Errorf("标记开始失败: 任务状态已变化 (id=%s)", task.ID)
 	}
-	return nil
+
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE issues SET status = 'in_progress', updated_at = ? WHERE id = ?`,
+		time.Now(), task.IssueID,
+	); err != nil {
+		return fmt.Errorf("同步任务状态失败: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // QueueItem 表示执行队列里的一行（用于查看流水线状态）

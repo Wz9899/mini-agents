@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestCreateIssue 验证：创建一条任务，能写进数据库并返回完整数据
@@ -375,3 +376,155 @@ func TestTeamStatusAndConversations(t *testing.T) {
 
 	t.Logf("✅ 会话带成员 + 团队状态聚合通过")
 }
+
+// TestIssueStatusSync 验证 issues.status 会随流水线同步：
+// 创建 todo → 开工 in_progress → 完成 done。
+func TestIssueStatusSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	agent, err := s.CreateAgent(ctx, "小王", "前端工程师", "负责页面", "fake")
+	if err != nil {
+		t.Fatalf("CreateAgent 失败: %v", err)
+	}
+	issue, err := s.CreateIssue(ctx, "状态同步", "", agent.ID, "")
+	if err != nil {
+		t.Fatalf("CreateIssue 失败: %v", err)
+	}
+
+	task, err := s.ClaimTask(ctx, agent.ID, agent.ID)
+	if err != nil {
+		t.Fatalf("ClaimTask 失败: %v", err)
+	}
+	if task == nil {
+		t.Fatal("没有任务可领")
+	}
+	if err := s.StartTask(ctx, task); err != nil {
+		t.Fatalf("StartTask 失败: %v", err)
+	}
+
+	issues, err := s.ListIssues(ctx)
+	if err != nil {
+		t.Fatalf("ListIssues 失败: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Status != "in_progress" {
+		t.Fatalf("开工后 issues.status 应为 in_progress，实际 %+v", issues)
+	}
+
+	if err := s.CompleteTask(ctx, task); err != nil {
+		t.Fatalf("CompleteTask 失败: %v", err)
+	}
+	issues, err = s.ListIssues(ctx)
+	if err != nil {
+		t.Fatalf("ListIssues 失败: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Status != "done" {
+		t.Fatalf("完成后 issues.status 应为 done，实际 %+v", issues)
+	}
+
+	_ = issue
+	t.Logf("✅ issues.status 同步通过：todo → in_progress → done")
+}
+
+// TestBlockTaskSync 验证 BlockTask 会把 issues.status 同步成 blocked。
+func TestBlockTaskSync(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	agent, err := s.CreateAgent(ctx, "小赵", "测试工程师", "负责测试", "fake")
+	if err != nil {
+		t.Fatalf("CreateAgent 失败: %v", err)
+	}
+	if _, err := s.CreateIssue(ctx, "我干不了", "需要人类", agent.ID, ""); err != nil {
+		t.Fatalf("CreateIssue 失败: %v", err)
+	}
+
+	task, err := s.ClaimTask(ctx, agent.ID, agent.ID)
+	if err != nil {
+		t.Fatalf("ClaimTask 失败: %v", err)
+	}
+	if task == nil {
+		t.Fatal("没有任务可领")
+	}
+	if err := s.StartTask(ctx, task); err != nil {
+		t.Fatalf("StartTask 失败: %v", err)
+	}
+	if err := s.BlockTask(ctx, task, "我无法完成：缺数据库权限"); err != nil {
+		t.Fatalf("BlockTask 失败: %v", err)
+	}
+
+	issues, err := s.ListIssues(ctx)
+	if err != nil {
+		t.Fatalf("ListIssues 失败: %v", err)
+	}
+	if len(issues) != 1 || issues[0].Status != "blocked" {
+		t.Fatalf("blocked 后 issues.status 应为 blocked，实际 %+v", issues)
+	}
+
+	t.Logf("✅ BlockTask 同步通过：issues.status = blocked")
+}
+
+// TestRequeueStaleTasks 验证孤儿任务回收：
+// dispatched 且 dispatched_at 超时、started_at 为空的任务应回退 queued。
+func TestRequeueStaleTasks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	agent, err := s.CreateAgent(ctx, "小王", "前端工程师", "负责页面", "fake")
+	if err != nil {
+		t.Fatalf("CreateAgent 失败: %v", err)
+	}
+	if _, err := s.CreateIssue(ctx, "孤儿任务", "", agent.ID, ""); err != nil {
+		t.Fatalf("CreateIssue 失败: %v", err)
+	}
+
+	task, err := s.ClaimTask(ctx, agent.ID, agent.ID)
+	if err != nil {
+		t.Fatalf("ClaimTask 失败: %v", err)
+	}
+	if task == nil {
+		t.Fatal("没有任务可领")
+	}
+
+	// 模拟：认领后进程被杀，dispatched_at 已超时，但 started_at 一直为空
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE task_queue SET dispatched_at = ? WHERE id = ?`,
+		time.Now().Add(-20*time.Minute), task.ID,
+	); err != nil {
+		t.Fatalf("更新 dispatched_at 失败: %v", err)
+	}
+
+	n, err := s.RequeueStaleTasks(ctx, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("RequeueStaleTasks 失败: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("应回收 1 条孤儿任务，实际 %d", n)
+	}
+
+	items, err := s.ListQueue(ctx)
+	if err != nil {
+		t.Fatalf("ListQueue 失败: %v", err)
+	}
+	if len(items) != 1 || items[0].Status != "queued" {
+		t.Fatalf("孤儿任务应回退 queued，实际 %+v", items)
+	}
+
+	t.Logf("✅ 孤儿任务回收通过：dispatched 超时未开工 → queued")
+}
+

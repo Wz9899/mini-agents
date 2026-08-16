@@ -2,14 +2,20 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 
 	"mini-agents/internal/store"
 )
 
 func main() {
+	// 0. 启动参数：默认只监听本机，避免局域网内其他人访问
+	addr := flag.String("addr", "127.0.0.1:8080", "监听地址")
+	flag.Parse()
+
 	// 1. 打开数据库（自动建表）
 	s, err := store.Open("mini-agents.db")
 	if err != nil {
@@ -34,9 +40,9 @@ func main() {
 	// 所以 /api/... 走上面注册的精确路由，剩下的（如 / 和 /index.html）才落进这里。
 	mux.Handle("GET /", http.FileServer(http.Dir("web")))
 
-	// 3. 启动 HTTP 服务，监听 8080 端口
-	log.Println("服务已启动: http://localhost:8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	// 3. 启动 HTTP 服务
+	log.Printf("服务已启动: http://%s", *addr)
+	if err := http.ListenAndServe(*addr, mux); err != nil {
 		log.Fatalf("服务启动失败: %v", err)
 	}
 }
@@ -301,11 +307,30 @@ func handleCreateMessage(s *store.Store) http.HandlerFunc {
 				http.Error(w, "查询员工失败: "+err.Error(), http.StatusInternalServerError)
 				return
 			}
+			// 按名字长度从长到短排序，先匹配长名字，避免 @小王总 误命中 小王
+			sort.Slice(all, func(i, j int) bool { return len(all[i].Name) > len(all[j].Name) })
 			var mentioned []store.Agent
 			for i := range all {
-				// 不 break！一条消息可以 @ 多人，全部收集
-				if strings.Contains(req.Content, "@"+all[i].Name) {
-					mentioned = append(mentioned, all[i])
+				name := all[i].Name
+				// 一条消息可以 @ 多人，全部收集；同名员工只触发一次
+				for _, chunk := range strings.Split(req.Content, "@")[1:] {
+					if chunk == name {
+						mentioned = append(mentioned, all[i])
+						break
+					}
+					if strings.HasPrefix(chunk, name) && len(chunk) > len(name) {
+						// 取名字后第一个完整字符：中文标点占多个字节，必须转 []rune 再取，
+						// 直接 chunk[len(name)] 只拿到第一个 byte，跟 rune 标点比较会编译报错
+						next := []rune(chunk[len(name):])[0]
+						if next == ' ' || next == '\t' || next == '\n' ||
+							next == ',' || next == '，' || next == '。' ||
+							next == '、' || next == ';' || next == '；' ||
+							next == ':' || next == '：' || next == '!' || next == '！' ||
+							next == '?' || next == '？' {
+							mentioned = append(mentioned, all[i])
+							break
+						}
+					}
 				}
 			}
 			// 群成员校验：@ 的人必须在群里（社交软件语义：群里只能点到群里的人）
@@ -349,21 +374,11 @@ func handleCreateMessage(s *store.Store) http.HandlerFunc {
 		}
 
 		// ④ 人类发消息：sender_type=user，sender_id='me'（人类是隐式所有者）
-		// 主任务写 messages.task_id（兼容旧逻辑/前端展示），全部任务走 message_tasks 关联表
-		primary := ""
-		if len(taskIDs) > 0 {
-			primary = taskIDs[0]
-		}
-		msg, err := s.SendMessage(r.Context(), convID, "user", "me", req.Content, primary)
+		// 用 SendMessageWithTasks 把"消息 + 任务关联"放进一个事务，避免半截状态。
+		msg, err := s.SendMessageWithTasks(r.Context(), convID, "user", "me", req.Content, taskIDs)
 		if err != nil {
 			http.Error(w, "发送消息失败: "+err.Error(), http.StatusInternalServerError)
 			return
-		}
-		if len(taskIDs) > 0 {
-			if err := s.AttachTasks(r.Context(), msg.ID, taskIDs); err != nil {
-				http.Error(w, "关联任务失败: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -372,11 +387,13 @@ func handleCreateMessage(s *store.Store) http.HandlerFunc {
 	}
 }
 
-// handleListMessages 返回一个"取消息流"的处理函数（前端 2 秒轮询用）
+// handleListMessages 返回一个"取消息流"的处理函数（前端 2 秒轮询用）。
+// 支持 ?after=<消息ID> 做增量拉取：前端传上次最后一条消息 id，后端只返回新消息。
 func handleListMessages(s *store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		convID := r.PathValue("id")
-		msgs, err := s.ListMessages(r.Context(), convID)
+		after := r.URL.Query().Get("after")
+		msgs, err := s.ListMessagesAfter(r.Context(), convID, after)
 		if err != nil {
 			http.Error(w, "查询消息失败: "+err.Error(), http.StatusInternalServerError)
 			return

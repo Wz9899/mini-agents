@@ -12,10 +12,13 @@
 ## ✨ 特性
 
 - **任务管理**：HTTP API 创建 / 查询任务
-- **任务队列 + 状态机**：`queued → dispatched → running → completed/failed`
+- **任务队列 + 状态机**：`queued → dispatched → running → completed / failed / blocked`
+- **业务状态同步**：`issues.status` 随流水线实时更新（`todo / in_progress / done / blocked`）
 - **乐观锁认领**：一条 `UPDATE ... WHERE status='queued'` 原子完成"抢单 + 标记"，多 worker 并发也不重复执行
 - **幂等汇报**：`claim_token` 凭证 + 状态校验，重复调用不会搞坏状态
-- **真实 Agent 执行**：worker 调用 `claude -p` 完成任务，带超时保护
+- **多 Agent**：`cmd/agent -name 小王` 启动员工进程，只认领指派给自己的任务
+- **真实 Agent 执行**：worker 调用 `claude -p` 完成任务，带超时保护；支持多引擎（claude / pi / fake）
+- **可靠性**：失败自动重试，耗尽 `blocked` 上报；孤儿任务自动回收
 - **全程记账**：每次执行的结果 / 耗时 / 退出码写入 `agent_runs`，可追溯
 - **零 CGO**：纯 Go 驱动（`modernc.org/sqlite`），跨平台，单机一键运行
 
@@ -31,15 +34,17 @@
                         │ 调用
 ┌───────────────────────▼────────────────────────┐
 │ 数据层  internal/store/                        │
-│   所有 SQL 只在这一层 · 14 个操作方法          │
+│   所有 SQL 只在这一层 · 含事务 / 状态同步      │
 └───────────────────────┬────────────────────────┘
                         │ 读写
 ┌───────────────────────▼────────────────────────┐
-│ 数据库  SQLite（issues / task_queue / agent_runs）│
+│ 数据库  SQLite（issues / task_queue / agent_runs │
+│         agents / conversations / messages ...） │
 └────────────────────────────────────────────────┘
 
   Agent 执行器 internal/agent/   ← 与数据层平级，由 worker 依赖注入
-    worker 循环：认领 → 开工 → 读任务 → 调 claude → 记账 → 汇报
+    agent 循环：认领 → 开工 → 读任务 → 调引擎 → 记账 → 汇报
+     每轮先回收孤儿任务（dispatched/running 超时回退）
 ```
 
 ## 📁 目录结构
@@ -47,8 +52,8 @@
 ```
 mini-agents/
 ├── cmd/
-│   ├── server/        HTTP 服务（任务 API）
-│   ├── worker/        worker 进程（自动干活）
+│   ├── server/        HTTP 服务（任务 API，默认监听 127.0.0.1:8080）
+│   ├── agent/         agent 进程（-name 员工名，自动干活）
 │   └── dump/          调试工具（查看队列 / 执行日志）
 ├── internal/
 │   ├── store/         数据层（schema.sql + store.go + 测试）
@@ -65,7 +70,7 @@ mini-agents/
 | 组件 | 说明 |
 |---|---|
 | **Go 1.26+** | [go.dev](https://go.dev/dl/) |
-| **Claude CLI**（可选） | worker 真实执行需要；装 [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup)。不装则 worker 的"执行"跳过 |
+| **Claude CLI / Pi**（可选） | agent 真实执行需要；装 [Claude Code](https://docs.anthropic.com/en/docs/claude-code/setup)。不装可把引擎设为 `fake` 跑通流程 |
 
 ### 安装与运行
 
@@ -77,36 +82,40 @@ cd mini-agents
 # 2. 编译（首次会自动下载依赖）
 go build ./...
 
-# 3. 终端 A：启动 HTTP 服务
+# 3. 终端 A：启动 HTTP 服务（默认只监听本机）
 go run ./cmd/server
-# → 服务已启动: http://localhost:8080
+# → 服务已启动: http://127.0.0.1:8080
 
-# 4. 终端 B：启动 worker（自动认领任务并调用 claude）
-go run ./cmd/worker
+# 4. 终端 B：让员工小王入职并启动它的 agent 进程（自动认领任务并调用引擎）
+curl -X POST http://127.0.0.1:8080/api/agents \
+  -H "Content-Type: application/json" \
+  -d '{"name":"小王","role":"前端工程师","engine":"fake"}'
+
+go run ./cmd/agent -name 小王
 ```
 
 ## 🧪 使用示例
 
 ```bash
-# 创建一条任务
-curl -X POST http://localhost:8080/api/issues \
+# 创建一条任务（assignee 填员工名字，不是 id）
+curl -X POST http://127.0.0.1:8080/api/issues \
   -H "Content-Type: application/json" \
-  -d '{"title":"用一句话介绍 Go 语言","description":"交给 claude"}'
+  -d '{"title":"用一句话介绍 Go 语言","description":"交给小王","assignee":"小王"}'
 
 # 查看所有任务
-curl http://localhost:8080/api/issues
+curl http://127.0.0.1:8080/api/issues
 
 # 查看队列和执行日志（调试工具）
 go run ./cmd/dump
 ```
 
-worker 运行日志示例：
+agent 运行日志示例：
 
 ```
 ✅ 认领到任务: 队列=01KZP50W... 任务=01KZP50W...
-🔨 调 claude 执行: 用一句话介绍 Go 语言
+🔨 调引擎执行: 用一句话介绍 Go 语言
 🏁 任务完成: 用一句话介绍 Go 语言 (执行记录 01KZP514...)
-   claude 回答: Go 语言（又称 Golang）是谷歌于 2009 年开源的一种静态类型、编译型编程语言……
+   引擎回答: Go 语言（又称 Golang）是谷歌于 2009 年开源的一种静态类型、编译型编程语言……
 ```
 
 ## 📊 数据模型

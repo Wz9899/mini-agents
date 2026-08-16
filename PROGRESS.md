@@ -114,17 +114,25 @@
 - **agent 启动时读一次身份**（V2 M8-1）：`me := GetAgent()` 在 main 读一次存内存、每轮复用——改 agents 表身份**必须重启进程**才生效，否则以为改了没生效（进程内缓存）
 - **身份空壳降级**（V2 M8-1）：`identityLabel` 条件拼接——role 空时输出"小王"而非"小王（）"，prompt 同理（role/desc 都有时输出与之前一致，回归安全）
 - **curl 命令行中文编码坑**（V2 M8-1 真坑）：Windows Git Bash 里 `curl -d '{"name":"小周"...}'` 中文被按 GBK 破坏成乱码（`С��`）；解法是 JSON 写 UTF-8 文件 + `curl --data-binary @file`。**前端 fetch 的 JSON.stringify 走 UTF-8 无此问题**——只坑命令行，产品功能不受影响
+- **业务状态同步**（RD P0-1）：`issues.status` 是业务视图，`task_queue.status` 是流水线视图。两者必须在同一事务里同步（`StartTask→in_progress`、`CompleteTask→done`、`FailTask→in_progress/blocked`、`BlockTask→blocked`），否则 API 看到的是过期状态
+- **写操作事务化**（RD P0-2/P0-3）：`CreateIssue` 要包住"issues 插入 + task_queue 入队"；`SendMessageWithTasks` 要包住"消息插入 + message_tasks 关联"——半截写是隐形 bug，事务是正解
+- **孤儿任务回收**（RD P0-5）：进程被杀会留下 `dispatched/running` 任务。`running` 用 `started_at` 判超时；`dispatched` 且未开工必须单独记 `dispatched_at` 判超时——只认 `started_at` 会漏掉一类孤儿
+- **旧库自动迁移**（RD P0-5）：`CREATE TABLE IF NOT EXISTS` 不会给旧表补新列。新增列时用 `PRAGMA table_info` 检查 + `ALTER TABLE` 补列，让旧 DB 打开时自动升级
+- **@ 解析边界匹配**（RD P2-4）：`strings.Contains` 会把"@小王总"误判给"小王"。先按名字长度降序匹配长名，再检查 `@name` 后一个字符必须是空白/标点/结尾
+- **空闲日志降噪**（RD P2-1）：每 2 秒一条"没有派给我的活"会刷爆日志。用状态变化触发打印（只在从有活到没活时打一次），既安静又能发现问题
 
 ## 文件清单（当前）
 
 ```
 mini-agents/
   go.mod                      ✅ go 1.26.5
-  internal/store/schema.sql   ✅ 8 张表（issues/task_queue/agent_runs/agents/conversations/conversation_members/messages/message_tasks）
-  internal/store/store.go     ✅ 数据层（含会话/消息 CRUD + GetMessageByTask + AttachTasks + GetConversationContext）
-  internal/store/store_test.go ✅ CreateIssue + 会话消息闭环测试通过
-  cmd/server/main.go          ✅ HTTP 服务（issues/agents/conversations/messages/team 路由 + 静态文件）
-  cmd/agent/main.go           ✅ Agent 入口（-name 认领自己的任务；按 agents.engine 选引擎；M5 失败重试/上报/级联）
+  .gitignore                  ✅ 运行产物/日志/数据库文件已忽略
+  docs/rd.md                  ✅ 优化 RD 文档（P0-P2 清单与方案）
+  internal/store/schema.sql   ✅ 8 张表 + 业务索引 + task_queue.dispatched_at
+  internal/store/store.go     ✅ 数据层（事务化 CreateIssue/SendMessageWithTasks；issues.status 同步；RequeueStaleTasks 孤儿回收）
+  internal/store/store_test.go ✅ 任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收测试
+  cmd/server/main.go          ✅ HTTP 服务（默认 127.0.0.1:8080；issues/agents/conversations/messages/team 路由 + 静态文件）
+  cmd/agent/main.go           ✅ Agent 入口（-name 认领自己的任务；孤儿回收；失败重试/上报/级联；空闲日志降噪）
   cmd/dump/main.go            ✅ 查看任务+队列+执行日志的小工具（调试用）
   internal/agent/runner.go    ✅ Engine 接口 + ClaudeEngine（直连 claude.exe 避编码坑；注入角色人设）
   internal/agent/pi.go        ✅ PiEngine（pi --mode rpc，JSONL 流式攒 text_delta）

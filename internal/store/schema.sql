@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS task_queue (
   worker_id    TEXT,                           -- 是哪个 worker 在执行
   error        TEXT,                           -- 失败时记录错误信息
   created_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    dispatched_at TIMESTAMP,                     -- 认领时间（可能为空，孤儿回收用）
   started_at   TIMESTAMP,                      -- 开始执行时间（可能为空）
   finished_at  TIMESTAMP                       -- 结束时间（可能为空）
 );
@@ -81,3 +82,11 @@ CREATE TABLE IF NOT EXISTS message_tasks (
   task_id    TEXT NOT NULL REFERENCES issues(id),    -- 任务 id（外键指向 issues）
   PRIMARY KEY (message_id, task_id)                  -- 组合主键：同一个(消息,任务)组合最多出现一次
 );
+
+-- 业务索引：高频查询字段建索引，数据量增长后避免全表扫描
+CREATE INDEX IF NOT EXISTS idx_task_queue_status ON task_queue(status);
+CREATE INDEX IF NOT EXISTS idx_task_queue_issue ON task_queue(issue_id);
+CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee_id);
+CREATE INDEX IF NOT EXISTS idx_issues_depends_on ON issues(depends_on);
+CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_message_tasks_task ON message_tasks(task_id);

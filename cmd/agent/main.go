@@ -39,31 +39,57 @@ func main() {
 	runner := agent.NewEngine(me.Engine)
 	log.Printf("🧑💻 %s [引擎:%s] 开工: %s", identityLabel(me), me.Engine, me.ID)
 
+	// 启动时先回收一次孤儿任务（进程被杀残留的 dispatched/running）
+	ctx := context.Background()
+	if n, err := s.RequeueStaleTasks(ctx, 10*time.Minute); err != nil {
+		log.Printf("⚠️  孤儿任务回收失败: %v", err)
+	} else if n > 0 {
+		log.Printf("🧹 回收孤儿任务 %d 条", n)
+	}
+
+	idle := false // 空闲日志降噪：只在"从有活到没活"时打印一次
 	for {
-		runOnce(s, runner, me)
+		if n, err := s.RequeueStaleTasks(ctx, 10*time.Minute); err != nil {
+			log.Printf("⚠️  孤儿任务回收失败: %v", err)
+		} else if n > 0 {
+			log.Printf("🧹 回收孤儿任务 %d 条", n)
+		}
+
+		worked := runOnce(s, runner, me)
+		if !worked {
+			if !idle {
+				log.Println("🕊️  没有派给我的活，歇会儿")
+				idle = true
+			}
+		} else {
+			idle = false
+		}
 		time.Sleep(2 * time.Second) // 干完一轮歇 2 秒
 	}
 }
 
-// runOnce 干一轮活：认领（只认领派给我的）→ 开工 → 读任务 → 调引擎 → 记账 → 汇报
-func runOnce(s *store.Store, runner agent.Engine, me *store.Agent) {
+// runOnce 干一轮活：认领（只认领派给我的）→ 开工 → 读任务 → 调引擎 → 记账 → 汇报。
+// 返回是否真的认领到了任务（供外层做空闲日志降噪）。
+func runOnce(s *store.Store, runner agent.Engine, me *store.Agent) (worked bool) {
 	ctx := context.Background()
 
 	// ① 认领：workerID 和 assigneeID 都填我的员工 id（身份 = 账本）
 	task, err := s.ClaimTask(ctx, me.ID, me.ID)
 	if err != nil {
 		log.Printf("⚠️  认领出错: %v", err)
-		return
+		return false
 	}
 	if task == nil {
-		log.Println("🕊️  没有派给我的活，歇会儿")
-		return
+		return false
 	}
+	worked = true
 	log.Printf("✅ 认领到任务: 队列=%s 任务=%s", task.ID, task.IssueID)
 
-	// ② 开工
+	// ② 开工：失败不能直接 return，否则任务会卡死在 dispatched（ClaimTask 只认领 queued）。
+	// 走统一失败处理：让它回退 queued 或上报 blocked。
 	if err := s.StartTask(ctx, task); err != nil {
 		log.Printf("⚠️  开工失败: %v", err)
+		reportFailure(s, task, err.Error())
 		return
 	}
 
@@ -162,7 +188,7 @@ func runOnce(s *store.Store, runner agent.Engine, me *store.Agent) {
 	// 为什么不重试？claude 这种回答不是"技术故障"（技术故障重试几次可能就好），
 	// 而是"这活本身做不了"，重试只会得到同样答案、再烧一次 token。
 	// 所以用 BlockTask（不涨 attempts），让人类来看怎么办。
-	if strings.HasPrefix(result.Output, "我无法完成") {
+	if strings.HasPrefix(strings.TrimSpace(result.Output), "我无法完成") {
 		reason := firstLine(result.Output) // 只要第一行，把原因摘出来给人类看
 		if err := s.BlockTask(ctx, task, reason); err != nil {
 			log.Printf("⚠️  上报 blocked 失败: %v", err)
@@ -191,6 +217,7 @@ func runOnce(s *store.Store, runner agent.Engine, me *store.Agent) {
 			log.Printf("💬 已回复会话: %s", src.ConversationID)
 		}
 	}
+	return // 正常完成路径也必须有 return（worked 已为 true，裸 return 返回它）
 }
 
 // reportFailure 统一处理"失败"：交给 store 层做重试/上报决策，再按结果打不同日志。

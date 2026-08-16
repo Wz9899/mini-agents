@@ -347,6 +347,7 @@
     let convs = [];         // 会话列表（带成员）
     let team = [];          // 团队状态 [{ID,Name,Role,Status}]
     let agents = [];        // 全部员工档案（新建会话的成员多选用）
+    let lastMsg = null;     // 增量拉取游标：最后一条消息 {ID, CreatedAt}；null = 全量刷新
 
     /* ═══ 2. 拉数据的两个小工具 ═══ */
     // getJSON：抓一个接口并解析成对象数组。!res.ok = HTTP 非 2xx → 抛错
@@ -373,9 +374,21 @@
       renderConvs(); // 状态灯变了 → 列表重画（顺带刷新头部）
     }
     async function loadMessages() {
-      if (!currentConv) { renderMessages([]); return; } // 没选会话就显示空
-      const msgs = await getJSON('/api/conversations/' + currentConv + '/messages');
-      renderMessages(msgs);
+      if (!currentConv) { lastMsg = null; renderMessages([]); return; } // 没选会话就显示空
+      let url = '/api/conversations/' + currentConv + '/messages';
+      if (lastMsg) url += '?after=' + encodeURIComponent(lastMsg.ID); // 增量拉取
+      const msgs = await getJSON(url);
+      if (lastMsg) {
+        // 增量：只把新消息追加到消息流末尾
+        if (msgs.length > 0) {
+          renderMessages(msgs, true);
+          lastMsg = msgs[msgs.length - 1];
+        }
+      } else {
+        // 全量：重建消息流并记住游标
+        renderMessages(msgs);
+        if (msgs.length > 0) lastMsg = msgs[msgs.length - 1];
+      }
     }
     async function loadAgents() {
       agents = await getJSON('/api/agents');
@@ -403,6 +416,7 @@
         li.className = 'conv-item' + (c.ID === currentConv ? ' active' : '');
         li.onclick = () => { // 点会话 = 切换当前会话并拉消息
           currentConv = c.ID;
+            lastMsg = null; // 切换会话后必须全量重建，避免把上个会话的游标带过来
           renderConvs(); // 立刻重画（高亮跟着变）
           loadMessages();
         };
@@ -449,12 +463,12 @@
     }
 
     /* ═══ 6. 渲染：消息流（工作记录流）═══ */
-    function renderMessages(msgs) {
+    function renderMessages(msgs, append) {
       const flow = document.getElementById('msg-flow');
       const nearBottom = flow.scrollHeight - flow.scrollTop - flow.clientHeight < 80;
       // 记录"是不是在底部"：在底部就自动贴底，正在往上翻历史就别打扰
-      flow.innerHTML = '';
-      if (msgs.length === 0) {
+      if (!append) flow.innerHTML = '';
+      if (msgs.length === 0 && !append) {
         flow.innerHTML = '<p class="empty">还没有消息。点击右上 @ 成员开始安排工作。</p>';
       } else {
         for (const m of msgs) {
