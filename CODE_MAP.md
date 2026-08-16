@@ -21,9 +21,9 @@ mini-agents/
 │
 ├── internal/                   「内部业务代码」目录（external 不可引用）
 │   ├── store/                  数据层（只管数据，不碰 HTTP）
-│   │   ├── schema.sql  约90行   8 张表建表语句（幂等）+ 业务索引
-│   │   ├── store.go   约1160行  数据操作 + 事务 + 状态同步 + 孤儿回收 + 增量消息
-│   │   └── store_test.go 约590行 测试：任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收/消息事务
+│   │   ├── schema.sql  约106行  9 张表建表语句（幂等）+ 业务索引
+│   │   ├── store.go   约1300行  数据操作 + 事务 + 状态同步 + 孤儿回收 + 增量消息 + 知识库
+│   │   └── store_test.go 约620行 测试：任务/会话消息/重试/blocked/级联/团队状态/状态同步/孤儿回收/消息事务/知识库
 │   └── agent/                  Agent 执行器
 │       ├── runner.go 79行       ClaudeEngine：封装 claude -p 调用
 │       ├── pi.go     91行       PiEngine：pi --mode rpc JSONL 流式执行
@@ -31,6 +31,8 @@ mini-agents/
 │       ├── fake.go   24行       FakeEngine：干跑测试用
 │       ├── engine.go 18行       NewEngine 工厂（按名字选实现）
 │       └── engine_test.go 约40行 引擎测试（FakeEngine + NewEngine 工厂）
+│   ├── memory/                  M7 双层知识库门面
+│   │   └── memory.go 约40行      Capture/Recall/RecallForAgent
 │
 └── web/                        前端目录（M6 飞书式「夜间调度台」）
     └── index.html 约613行       会话列表 + 消息流 + 链式轮询 + 增量拉取 + 无障碍
@@ -74,6 +76,7 @@ Agent 执行器（`internal/agent/`）与数据层**平级**，被 `cmd/agent` �
 | 会话 | `CreateConversation` / `ListConversationsWithMembers` / `GetConversation` / `ListConversationMembers` | 会话与成员 |
 | 消息 | `SendMessage` / `SendMessageWithTasks` / `AttachTasks` / `ListMessages` / `ListMessagesAfter` / `GetMessageByTask` / `GetConversationContext` | 消息与任务关联、增量拉取 |
 | 查看 | `ListQueue` / `TeamStatus` | 看队列 / 看团队状态 |
+| 知识库 | `CaptureMemory` / `RecallMemory` / `RecallMemoryForAgent` | M7 双层知识库：写入 / 按作用域读取 / 拼装注入文本 |
 
 **核心技巧**：`ClaimTask` 用一条 `UPDATE ... WHERE status='queued'` 实现"抢 + 标记"原子操作（乐观锁），配合 `claim_token` 凭证和 `status IN (...)` 校验实现幂等。
 

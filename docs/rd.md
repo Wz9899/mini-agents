@@ -34,7 +34,7 @@ mini-agents 是一个用 Go + SQLite 实现的单机多 Agent 协调工具。当
 
 ### 1.2 非目标
 
-- 不引入 M7 双层知识库（另有课程计划）。
+- M7 双层知识库已按项目计划落地（`memory` 表 + `internal/memory` + `/api/memory`），不再作为本文档的优化项。
 - 不将轮询升级为 WebSocket/SSE（列入后续演进，不在本次范围）。
 - 不重构整体架构（保持 `server / agent / store` 三层骨架不变）。
 

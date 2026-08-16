@@ -164,6 +164,16 @@ func runOnce(s *store.Store, runner agent.Engine, me *store.Agent) (worked bool)
 		prompt += sb.String()
 		log.Printf("💬 已注入会话背景 %d 条", len(ctxMsgs))
 	}
+
+	// M7 双层知识库：团队共享知识 + 本人私有知识，注入 prompt。
+	// 与会话背景不同，知识库是"沉淀内容"（文档/代码），不是临时交流。
+	if memText, err := s.RecallMemoryForAgent(ctx, me.ID); err != nil {
+		log.Printf("⚠️  读知识库失败: %v", err)
+	} else if memText != "" {
+		prompt += "\n\n── 知识库（团队共享 + 个人私有）──\n" + memText
+		log.Printf("📚 已注入知识库")
+	}
+
 	log.Printf("🔨 调引擎执行: %s", issue.Title)
 
 	// 给 claude 设 2 分钟超时，防止它卡死（CommandContext 配合 WithTimeout）

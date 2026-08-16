@@ -48,6 +48,8 @@ func newMux(s *store.Store) *http.ServeMux {
 	mux.HandleFunc("POST /api/conversations/{id}/messages", handleCreateMessage(s))
 	mux.HandleFunc("GET /api/conversations/{id}/messages", handleListMessages(s))
 	mux.HandleFunc("GET /api/team", handleTeam(s)) // 团队状态：前端状态灯轮询
+	mux.HandleFunc("POST /api/memory", handleCreateMemory(s)) // M7 知识库：写入团队/个人知识
+	mux.HandleFunc("GET /api/memory", handleListMemory(s))    // M7 知识库：按作用域读取
 
 	// 2.5 前端静态文件（M6 飞书式界面）：web/ 目录按"文件系统"暴露。
 	// 为什么用 "GET /"？它是兜底路由——ServeMux 永远选"最长匹配"，
@@ -275,6 +277,108 @@ func handleTeam(s *store.Store) http.HandlerFunc {
 		json.NewEncoder(w).Encode(status)
 	}
 }
+
+// handleCreateMemory 写入一条团队或个人知识（M7）。
+// 请求体：{"scope":"team|agent","agent":"小王(可选)","kind":"doc|code","content":"..."}
+func handleCreateMemory(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Scope   string `json:"scope"`
+			Agent   string `json:"agent"`
+			Kind    string `json:"kind"`
+			Content string `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "请求体不是合法 JSON", http.StatusBadRequest)
+			return
+		}
+		if req.Scope != "team" && req.Scope != "agent" {
+			http.Error(w, "scope 必须是 team|agent", http.StatusBadRequest)
+			return
+		}
+		if req.Content == "" {
+			http.Error(w, "content 不能为空", http.StatusBadRequest)
+			return
+		}
+		if req.Kind == "" {
+			req.Kind = "doc"
+		}
+		if req.Kind != "doc" && req.Kind != "code" {
+			http.Error(w, "kind 必须是 doc|code", http.StatusBadRequest)
+			return
+		}
+
+		agentID := ""
+		if req.Scope == "agent" {
+			if req.Agent == "" {
+				http.Error(w, "agent 作用域必须填写 agent 名字", http.StatusBadRequest)
+				return
+			}
+			who, err := s.GetAgent(r.Context(), req.Agent)
+			if err != nil {
+				http.Error(w, "查询员工失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if who == nil {
+				http.Error(w, "员工不存在: "+req.Agent, http.StatusBadRequest)
+				return
+			}
+			agentID = who.ID
+		}
+
+		mem, err := s.CaptureMemory(r.Context(), req.Scope, agentID, req.Kind, req.Content)
+		if err != nil {
+			http.Error(w, "写入知识失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(mem)
+	}
+}
+
+// handleListMemory 读取知识（M7）。
+// GET /api/memory?scope=team
+// GET /api/memory?scope=agent&agent=小王
+func handleListMemory(s *store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		scope := r.URL.Query().Get("scope")
+		if scope != "team" && scope != "agent" {
+			http.Error(w, "scope 必须是 team|agent", http.StatusBadRequest)
+			return
+		}
+
+		agentID := ""
+		if scope == "agent" {
+			agentName := r.URL.Query().Get("agent")
+			if agentName == "" {
+				http.Error(w, "agent 作用域必须填写 agent 名字", http.StatusBadRequest)
+				return
+			}
+			who, err := s.GetAgent(r.Context(), agentName)
+			if err != nil {
+				http.Error(w, "查询员工失败: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if who == nil {
+				http.Error(w, "员工不存在: "+agentName, http.StatusBadRequest)
+				return
+			}
+			agentID = who.ID
+		}
+
+		mems, err := s.RecallMemory(r.Context(), scope, agentID)
+		if err != nil {
+			http.Error(w, "查询知识失败: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(mems)
+	}
+}
+
 
 // handleCreateMessage 返回一个"往会话发消息"的处理函数。
 // M8 触发语义（社交软件式）：

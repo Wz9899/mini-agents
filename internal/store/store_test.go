@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -570,4 +571,69 @@ func TestRequeueStaleTasks(t *testing.T) {
 
 	t.Logf("✅ 孤儿任务回收通过：dispatched 超时未开工 → queued")
 }
+
+// TestMemoryCaptureRecall 验证 M7 双层知识库：
+// 团队知识可被所有 agent 读到，个人知识只有本人能读到。
+func TestMemoryCaptureRecall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open 失败: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	wang, err := s.CreateAgent(ctx, "小王", "前端工程师", "负责页面", "fake")
+	if err != nil {
+		t.Fatalf("CreateAgent 失败: %v", err)
+	}
+	li, err := s.CreateAgent(ctx, "小李", "后端工程师", "负责接口", "fake")
+	if err != nil {
+		t.Fatalf("CreateAgent 失败: %v", err)
+	}
+
+	// 团队知识：所有 agent 都能读
+	if _, err := s.CaptureMemory(ctx, "team", "", "doc", "项目规范：代码提交前必须跑 go test"); err != nil {
+		t.Fatalf("CaptureMemory(team) 失败: %v", err)
+	}
+	// 小王私有知识：只有小王能读
+	if _, err := s.CaptureMemory(ctx, "agent", wang.ID, "doc", "我负责页面和组件库"); err != nil {
+		t.Fatalf("CaptureMemory(agent) 失败: %v", err)
+	}
+
+	teamMems, err := s.RecallMemory(ctx, "team", "")
+	if err != nil {
+		t.Fatalf("RecallMemory(team) 失败: %v", err)
+	}
+	if len(teamMems) != 1 || teamMems[0].Content != "项目规范：代码提交前必须跑 go test" {
+		t.Fatalf("团队知识应包含 1 条规范，实际 %+v", teamMems)
+	}
+
+	wangMems, err := s.RecallMemory(ctx, "agent", wang.ID)
+	if err != nil {
+		t.Fatalf("RecallMemory(agent) 失败: %v", err)
+	}
+	if len(wangMems) != 1 || wangMems[0].Content != "我负责页面和组件库" {
+		t.Fatalf("小王个人知识应包含 1 条，实际 %+v", wangMems)
+	}
+
+	liMems, err := s.RecallMemory(ctx, "agent", li.ID)
+	if err != nil {
+		t.Fatalf("RecallMemory(agent 小李) 失败: %v", err)
+	}
+	if len(liMems) != 0 {
+		t.Fatalf("小李不应读到小王私有知识，实际 %+v", liMems)
+	}
+
+	combined, err := s.RecallMemoryForAgent(ctx, wang.ID)
+	if err != nil {
+		t.Fatalf("RecallMemoryForAgent 失败: %v", err)
+	}
+	if !strings.Contains(combined, "项目规范") || !strings.Contains(combined, "我负责页面和组件库") {
+		t.Fatalf("小王应同时读到团队+个人知识，实际 %q", combined)
+	}
+
+	t.Logf("✅ M7 双层知识库通过：team 共享、agent 私有隔离")
+}
+
 

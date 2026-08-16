@@ -1206,3 +1206,103 @@ func (s *Store) TeamStatus(ctx context.Context) ([]AgentStatus, error) {
 	}
 	return agents, nil
 }
+
+// Memory 代表一条知识库记录（M7 双层知识库）。
+// scope=team 时 AgentID 为空；scope=agent 时 AgentID 指向 agents.id。
+type Memory struct {
+	ID        string
+	Scope     string // team | agent
+	AgentID   string // 可空；team 知识为空
+	Kind      string // doc | code
+	Content   string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// CaptureMemory 写入一条知识：团队共享（scope=team）或个人私有（scope=agent）。
+// 相同 (scope, agent_id, kind, content) 会新增一条，保留历史版本。
+func (s *Store) CaptureMemory(ctx context.Context, scope, agentID, kind, content string) (*Memory, error) {
+	now := time.Now()
+	m := &Memory{
+		ID:        NewID(),
+		Scope:     scope,
+		AgentID:   agentID,
+		Kind:      kind,
+		Content:   content,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	var agentArg any
+	if agentID != "" {
+		agentArg = agentID
+	}
+
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO memory (id, scope, agent_id, kind, content, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.Scope, agentArg, m.Kind, m.Content, m.CreatedAt, m.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("写入知识失败: %w", err)
+	}
+	return m, nil
+}
+
+// RecallMemory 按作用域读取知识：scope=team 时 agentID 传空；
+// scope=agent 时 agentID 传员工 id。返回按时间从旧到新排序。
+func (s *Store) RecallMemory(ctx context.Context, scope, agentID string) ([]Memory, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, scope, agent_id, kind, content, created_at, updated_at
+		 FROM memory
+		 WHERE scope = ? AND (agent_id = ? OR (? = '' AND agent_id IS NULL))
+		 ORDER BY created_at, id`,
+		scope, agentID, agentID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("查询知识失败: %w", err)
+	}
+	defer rows.Close()
+
+	mems := []Memory{}
+	for rows.Next() {
+		var m Memory
+		var agentIDVal sql.NullString
+		if err := rows.Scan(&m.ID, &m.Scope, &agentIDVal, &m.Kind, &m.Content, &m.CreatedAt, &m.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("读取知识行失败: %w", err)
+		}
+		if agentIDVal.Valid {
+			m.AgentID = agentIDVal.String
+		}
+		mems = append(mems, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历知识失败: %w", err)
+	}
+	return mems, nil
+}
+
+// RecallMemoryForAgent 取一个 agent 干活前要注入的全部知识：
+// 先取团队共享，再取个人私有，合并成一段文本。
+func (s *Store) RecallMemoryForAgent(ctx context.Context, agentID string) (string, error) {
+	var sb strings.Builder
+
+	teamMems, err := s.RecallMemory(ctx, "team", "")
+	if err != nil {
+		return "", err
+	}
+	for _, m := range teamMems {
+		sb.WriteString("【团队知识·" + m.Kind + "】\n" + m.Content + "\n\n")
+	}
+
+	agentMems, err := s.RecallMemory(ctx, "agent", agentID)
+	if err != nil {
+		return "", err
+	}
+	for _, m := range agentMems {
+		sb.WriteString("【个人知识·" + m.Kind + "】\n" + m.Content + "\n\n")
+	}
+
+	return sb.String(), nil
+}
+

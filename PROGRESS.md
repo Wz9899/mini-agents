@@ -57,8 +57,8 @@
 | M4.5-4 | **单聊闭环** | @解析→issues + agent 完成→回消息 | ✅ 已达成 |
 | 第 10 课 | **M5 可靠性** | `attempts` 自动重试（failed→queued）+ blocked 上报（重试耗尽 / claude"我无法完成"）+ 终端告警 | ✅ 已达成 |
 | 第 11 课 | **M6 飞书式前端** | 会话列表 + 消息流 + 输入框 + 2 秒轮询（原"团队看板"改造） | ✅ 已达成 |
-| 第 12 课 | **M7 双层知识库** | `memory` 表 scope（team/agent_id）+ 文档上传 + 代码归档 + 注入；**交流不沉淀**（会话历史临时查） | ⬜ 计划中 |
-| 第 13 课 | **M8 触发语义重构** | 单聊默认派活（不 @）/ 群聊 @ 才干活 + 成员校验 + 多 @ / 会话历史注入（来源会话最近 20 条） | ⬜ 计划中 |
+| 第 12 课 | **M7 双层知识库** | `memory` 表 scope（team/agent_id）+ 文档上传 + 代码归档 + 注入；**交流不沉淀**（会话历史临时查） | ✅ 已达成 |
+| 第 13 课 | **M8 触发语义重构** | 单聊默认派活（不 @）/ 群聊 @ 才干活 + 成员校验 + 多 @ / 会话历史注入（来源会话最近 20 条） | ✅ 已达成 |
 | 后 | **群聊 + 多 agent @** | 群成员各自领活（@提及 + 成员校验）→ **已被 M8 吸收** | ⬜ 并入 M8 |
 
 > 建议推进顺序（未确认）：M5 可靠性 → M6 飞书式前端 → M7 双层知识库
@@ -124,6 +124,7 @@
 - **前端链式轮询**（前端审核 P1）：`setInterval` 可能在上一次请求未结束时再次触发；改用 `setTimeout` 链式调用，等上一轮完成后再等 2 秒
 - **前端统一渲染**（前端审核 P1）：`loadConvs` / `loadTeam` 只更新数据，由 `tick` 或提交成功后统一调用一次 `renderConvs()`，避免一次轮询里多次清空重建 DOM
 - **前端无障碍**（前端审核 P2）：消息流加 `aria-live="polite"`，输入框加 `aria-label`，状态灯加 `role="img"` + `aria-label`，让屏幕阅读器能感知新消息和员工状态
+- **M7 双层知识库落地**：`memory` 表按 `scope` 区分团队共享和个人私有；`internal/memory` 封装 Capture/Recall；`cmd/agent` 执行前用 `RecallMemoryForAgent` 把团队 + 个人知识注入 prompt；HTTP 提供 `POST/GET /api/memory`
 - **time.Time.String() 存储格式坑**（V2 RD 验证真 bug）：SQLite 存 Go time.Time 时驱动按 `time.Time.String()` 落盘，带 `m=+XX.XXXX` 单调时钟后缀。单调时钟是进程私有读数，**扫描读回时必然丢失**（从字符串恢复不了）；再把读回的时间当查询参数绑回去，格式就与库值不一致（库值多了 ` m=...` 后缀）→ 字符串比较 `created_at > ?` 把"库值比前缀相同的参数长"当成 `>`，**游标消息自己也被返回** → 增量拉取重复返回。为什么孤儿回收没踩坑？它用 `time.Now().Add()` 直接生成 cutoff（进程内带 m=，与库值格式一致）；坑只出现在"扫描恢复"的时间戳上。**当前修复**：增量拉取不再用 `created_at` 做游标，改用消息 ULID `id > ?` 判断，ULID 本身按时间有序，从根上绕开单调时钟问题；前端恢复 `?after=` 增量拉取。后续仍建议统一时间格式常量（如 `2006-01-02 15:04:05.999999999 -07:00`），避免其他地方再次踩坑
 
 ## 文件清单（当前）
@@ -147,5 +148,5 @@ mini-agents/
   internal/agent/engine.go    ✅ NewEngine 工厂（按名字选实现，多态入口）
     internal/agent/engine_test.go ✅ 引擎测试（FakeEngine + NewEngine 工厂）
   web/index.html              ✅ M6 飞书式前端「夜间调度台」（会话列表+消息流+@chip+链式轮询+增量拉取+状态灯+无障碍；M8-1 加入职/新建会话面板）
-  internal/memory/            ⬜ M7 双层知识库（memory 表 + 文档/代码归档 + 注入）
+  internal/memory/memory.go   ✅ M7 双层知识库（Capture/Recall/RecallForAgent 门面）
 ```

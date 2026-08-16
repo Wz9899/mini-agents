@@ -19,6 +19,7 @@
 - **多 Agent**：`cmd/agent -name 小王` 启动员工进程，只认领指派给自己的任务
 - **真实 Agent 执行**：worker 调用 `claude -p` 完成任务，带超时保护；支持多引擎（claude / pi / fake）
 - **可靠性**：失败自动重试，耗尽 `blocked` 上报；孤儿任务自动回收
+- **双层知识库**：团队共享 + 个人私有，agent 执行前自动注入（M7）
 - **全程记账**：每次执行的结果 / 耗时 / 退出码写入 `agent_runs`，可追溯
 - **零 CGO**：纯 Go 驱动（`modernc.org/sqlite`），跨平台，单机一键运行
 
@@ -122,9 +123,13 @@ agent 运行日志示例：
 
 | 表 | 角色 | 关键字段 |
 |---|---|---|
-| `issues` | 待办清单（给人看） | id, title, description, status, assignee_type/id |
+| `agents` | 员工档案 | id, name, role, description, engine |
+| `issues` | 待办清单（给人看） | id, title, description, status, assignee_type/id, depends_on |
 | `task_queue` | 执行流水线（给机器看） | id, issue_id, status, attempts, claim_token, worker_id |
 | `agent_runs` | 执行日志（事后查） | id, task_id, exit_code, output, duration_ms |
+| `conversations` / `conversation_members` | 会话与成员 | 单聊 / 群聊关系 |
+| `messages` / `message_tasks` | 消息与任务触发关联 | 消息流、多 @ 触发 |
+| `memory` | M7 双层知识库 | scope, agent_id, kind, content |
 
 三张表通过 `issue_id` / `task_id` 关联（参照 Multica 的教训，生产环境刻意不用数据库外键，关系在应用层处理）。
 
@@ -144,7 +149,11 @@ go vet ./...
 | **M1** | 任务 CRUD（HTTP + SQLite 持久化） | ✅ |
 | **M2** | 队列 + worker + 乐观锁认领 + 幂等汇报 | ✅ |
 | **M3** | worker 真调 `claude -p`，结果记账 | ✅ |
-| 后续 | web 前端 / 多 worker 并发 / 失败重试 | ⬜ 计划中 |
+| **M4** | 多 Agent 核心 + 多引擎 + 协作任务 + 会话消息 | ✅ |
+| **M5** | 可靠性：重试 / blocked 上报 / 级联 | ✅ |
+| **M6** | 飞书式前端 | ✅ |
+| **M7** | 双层知识库 | ✅ |
+| **M8** | 触发语义重构（单聊/群聊 @） | ✅ |
 
 ## 📜 许可证
 

@@ -83,6 +83,19 @@ CREATE TABLE IF NOT EXISTS message_tasks (
   PRIMARY KEY (message_id, task_id)                  -- 组合主键：同一个(消息,任务)组合最多出现一次
 );
 
+-- 第 9 张表：双层知识库（M7）
+-- scope=team：团队共享知识；scope=agent：个人私有知识（agent_id 指向 agents.id）
+CREATE TABLE IF NOT EXISTS memory (
+  id         TEXT PRIMARY KEY,
+  scope      TEXT NOT NULL,               -- team | agent
+  agent_id   TEXT,                        -- scope=agent 时指向 agents.id；scope=team 时为 NULL
+  kind       TEXT NOT NULL DEFAULT 'doc', -- doc | code
+  content    TEXT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
 -- 业务索引：高频查询字段建索引，数据量增长后避免全表扫描
 CREATE INDEX IF NOT EXISTS idx_task_queue_status ON task_queue(status);
 CREATE INDEX IF NOT EXISTS idx_task_queue_issue ON task_queue(issue_id);
@@ -90,3 +103,4 @@ CREATE INDEX IF NOT EXISTS idx_issues_assignee ON issues(assignee_id);
 CREATE INDEX IF NOT EXISTS idx_issues_depends_on ON issues(depends_on);
 CREATE INDEX IF NOT EXISTS idx_messages_conv_created ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_message_tasks_task ON message_tasks(task_id);
+CREATE INDEX IF NOT EXISTS idx_memory_scope_agent ON memory(scope, agent_id);
